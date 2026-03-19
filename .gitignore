@@ -5,3 +5,6 @@ train/yolo26n.pt
 train/track_out.mp4
 train/quantize_result/__pycache__/DetectionModel.cpython-38.pyc
 train/quantize_result/DetectionModel.py
+train/quantize_result/bias_corr.pth
+.vscode/settings.json
+train/quantize_result/quant_info.json
