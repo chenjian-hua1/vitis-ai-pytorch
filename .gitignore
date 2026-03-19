@@ -1,3 +1,4 @@
 test file/model/resnet18_best.pth
 test file/model/resnet18_pruned.pth
 train/runs/*
+train/yolo26n.pt
