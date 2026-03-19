@@ -1,0 +1,18 @@
+boat_det/
+├── images/
+│   ├── train/
+│   │   ├── img001.jpg
+│   │   ├── img002.jpg
+│   ├── val/
+│   │   ├── img101.jpg
+│   │   ├── img102.jpg
+│
+├── labels/
+│   ├── train/
+│   │   ├── img001.txt
+│   │   ├── img002.txt
+│   ├── val/
+│   │   ├── img101.txt
+│   │   ├── img102.txt
+│
+└── data.yaml
