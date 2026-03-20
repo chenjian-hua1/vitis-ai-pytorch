@@ -8,3 +8,5 @@ train/quantize_result/DetectionModel.py
 train/quantize_result/bias_corr.pth
 .vscode/settings.json
 train/quantize_result/quant_info.json
+train/arch/__pycache__/yolo11.cpython-39.pyc
+train/utils/__pycache__/util.cpython-39.pyc
