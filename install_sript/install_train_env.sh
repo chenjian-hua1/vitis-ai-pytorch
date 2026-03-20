@@ -4,6 +4,7 @@ channels:
   - conda-forge
   - nvidia
   - pytorch
+  - files:///scratch/conda-channel
 dependencies:
   - _libgcc_mutex=0.1=main
   - _openmp_mutex=5.1=1_gnu
@@ -241,6 +242,7 @@ dependencies:
       - scipy==1.10.1
       - tabulate==0.9.0
       - tifffile==2024.8.30
+      - torchinfo==1.8.0
       - trackeval==0.1.4
       - tzdata==2025.3
       - ultralytics==8.4.21

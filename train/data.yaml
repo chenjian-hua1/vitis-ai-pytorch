@@ -3,6 +3,7 @@ path: /home/jianhua/Desktop/dataset/SeaDronesSee_MOT
 train: images/train
 val: images/val
 
+nc: 4
 names:
   0: swimmer
   1: swimmer_with_life_jacket
