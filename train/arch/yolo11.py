@@ -1,3 +1,5 @@
+# reference : https://github.com/jahongir7174/YOLOv11-pt/blob/master/nets/nn.py
+
 import math
 
 import torch
