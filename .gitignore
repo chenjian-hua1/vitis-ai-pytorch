@@ -10,3 +10,4 @@ train/quantize_result/bias_corr.pth
 train/quantize_result/quant_info.json
 train/arch/__pycache__/yolo11.cpython-39.pyc
 train/utils/__pycache__/util.cpython-39.pyc
+install_sript/condaenv.lp_zbqz9.requirements.txt
