@@ -37,6 +37,11 @@ if ! command -v conda &> /dev/null; then
 fi
 
 # =========================
+# Initialize conda
+# =========================
+source "$(conda info --base)/etc/profile.d/conda.sh"
+
+# =========================
 # Check YAML file
 # =========================
 if [ ! -f "$YAML_PATH" ]; then
@@ -52,7 +57,7 @@ echo "Creating environment: $ENV_NAME"
 # =========================
 if conda env list | grep -q "^$ENV_NAME "; then
   echo "Warning: Environment already exists. Removing..."
-  conda env remove -n "$ENV_NAME"
+  conda env remove -n "$ENV_NAME" -y
 fi
 
 # =========================
