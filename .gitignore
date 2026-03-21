@@ -12,3 +12,19 @@ train/arch/__pycache__/yolo11.cpython-39.pyc
 train/utils/__pycache__/util.cpython-39.pyc
 install_sript/condaenv.lp_zbqz9.requirements.txt
 train/yolo11n.pt
+test file/kv26_dpu/kv26_resnet18.xmodel
+test file/.vai/ResNet_ratio_0.1_pruning_info.json
+test file/.vai/ResNet_ratio_0.1.spec
+test file/.vai/ResNet.sens
+test file/kv26_dpu/md5sum.txt
+test file/resnet18_best.pth
+test file/resnet18_pruned.pth
+test file/kv26_dpu/meta.json
+test file/quantize_result/bias_corr.pth
+test file/quantize_result/inspect_DPUCZDX8G_ISA1_B4096.txt
+test file/quantize_result/quant_info.json
+test file/quantize_result/ResNet_int.onnx
+test file/quantize_result/ResNet_int.pt
+test file/quantize_result/ResNet_int.xmodel
+test file/quantize_result/ResNet.py
+test file/quantize_result/__pycache__/ResNet.cpython-38.pyc
