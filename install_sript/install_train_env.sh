@@ -71,4 +71,10 @@ conda env create -n "$ENV_NAME" -f "$YAML_PATH"
 echo "Activating environment..."
 conda activate "$ENV_NAME"
 
+echo "Install TrackEval , OpenCV , numpy"
+pip install trackeval==0.1.5 -y
+pip install opencv-python==4.11.0.86 -y
+pip install opencv-python-headless==4.11.0.86 -y
+pip install numpy==1.26 -y
+
 echo "Done! Environment '$ENV_NAME' is ready."
