@@ -24,6 +24,7 @@ class Dataset(data.Dataset):
         self.filenames = list(labels.keys())  # update
         self.n = len(self.filenames)  # number of samples
         self.indices = range(self.n)
+        
         # Albumentations (optional, only used if package is installed)
         self.albumentations = Albumentations()
 
@@ -61,16 +62,19 @@ class Dataset(data.Dataset):
         box = xy2wh(box, w, h)
 
         if self.augment:
-            # Albumentations
+            # Albumentations (強化版本)
             image, box, cls = self.albumentations(image, box, cls)
             nl = len(box)  # update after albumentations
+            
             # HSV color-space
             augment_hsv(image, self.params)
+            
             # Flip up-down
             if random.random() < self.params['flip_ud']:
                 image = numpy.flipud(image)
                 if nl:
                     box[:, 1] = 1 - box[:, 1]
+                    
             # Flip left-right
             if random.random() < self.params['flip_lr']:
                 image = numpy.fliplr(image)
@@ -381,34 +385,70 @@ def random_perspective(image, label, params, border=(0, 0)):
 
 def mix_up(image1, label1, image2, label2):
     # Applies MixUp augmentation https://arxiv.org/pdf/1710.09412.pdf
-    alpha = numpy.random.beta(a=32.0, b=32.0)  # mix-up ratio, alpha=beta=32.0
+    # [Note]: 原本的 a=32.0, b=32.0 會讓 alpha 極度趨近於 0.5，這是很強烈的融合。
+    # 如果你發現模型難以收斂，可以改成 a=8.0, b=8.0 甚至 a=1.5, b=1.5 增加隨機性。
+    alpha = numpy.random.beta(a=32.0, b=32.0)  
     image = (image1 * alpha + image2 * (1 - alpha)).astype(numpy.uint8)
     label = numpy.concatenate((label1, label2), 0)
     return image, label
 
 
+# ---------------------------------------------------------
+# [NEW] 強化的 Albumentations 類別
+# ---------------------------------------------------------
 class Albumentations:
-    def __init__(self):
+    def __init__(self, p=1.0):
         self.transform = None
         try:
-            import albumentations
+            import albumentations as A
 
-            transforms = [albumentations.Blur(p=0.01),
-                          albumentations.CLAHE(p=0.01),
-                          albumentations.ToGray(p=0.01),
-                          albumentations.MedianBlur(p=0.01)]
-            self.transform = albumentations.Compose(transforms,
-                                                    albumentations.BboxParams('yolo', ['class_labels']))
+            # 擴增多種現實場景中常見的干擾，提升模型的魯棒性
+            transforms = [
+                # 1. 影像品質破壞 (機率稍微調高)
+                A.Blur(p=0.05),
+                A.MedianBlur(p=0.05),
+                A.MotionBlur(p=0.05),
+                A.GaussNoise(var_limit=(10.0, 50.0), p=0.1),
+                
+                # 2. 光照與色彩增強 (互補原有的 HSV 增強)
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.2),
+                A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.1),
+                A.ToGray(p=0.05),
+                
+                # 3. 隨機遮擋 (Cutout 的變體，對物件偵測非常有效)
+                # 會在圖片上隨機挖黑色區塊，強迫模型學習物件的局部特徵
+                A.CoarseDropout(
+                    max_holes=8, max_height=32, max_width=32, 
+                    min_holes=2, min_height=8, min_width=8, 
+                    fill_value=0, p=0.2
+                )
+            ]
+            
+            # 設定 Bounding Box 的格式為 yolo (x_center, y_center, width, height 正規化)
+            # min_visibility 確保增強後如果 BBox 被裁切或遮擋超過 80%，就捨棄該標籤
+            self.transform = A.Compose(
+                transforms,
+                bbox_params=A.BboxParams(
+                    format='yolo', 
+                    label_fields=['class_labels'],
+                    min_area=16,          # 濾除面積太小的框
+                    min_visibility=0.2    # 確保物件至少有 20% 可見
+                )
+            )
 
         except ImportError:  # package not installed, skip
+            print("警告: 尚未安裝 albumentations，將跳過進階數據增強。請執行 `pip install albumentations`")
             pass
 
     def __call__(self, image, box, cls):
-        if self.transform:
-            x = self.transform(image=image,
-                               bboxes=box,
-                               class_labels=cls)
-            image = x['image']
-            box = numpy.array(x['bboxes'])
-            cls = numpy.array(x['class_labels'])
+        if self.transform and len(box) > 0:
+            try:
+                # 執行增強
+                x = self.transform(image=image, bboxes=box, class_labels=cls)
+                image = x['image']
+                box = numpy.array(x['bboxes']) if len(x['bboxes']) > 0 else numpy.zeros((0, 4))
+                cls = numpy.array(x['class_labels']) if len(x['class_labels']) > 0 else numpy.zeros((0, 1))
+            except Exception as e:
+                # 安全機制：如果 Albumentations 處理異常 (例如極端座標)，退回原圖
+                pass
         return image, box, cls
