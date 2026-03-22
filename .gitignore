@@ -28,3 +28,5 @@ test file/quantize_result/ResNet_int.pt
 test file/quantize_result/ResNet_int.xmodel
 test file/quantize_result/ResNet.py
 test file/quantize_result/__pycache__/ResNet.cpython-38.pyc
+train/utils/__pycache__/dataset.cpython-39.pyc
+train/ex.py

@@ -1,12 +1,14 @@
 import math
 import os
 import random
+import glob
 
 import cv2
 import numpy
 import torch
 from PIL import Image
 from torch.utils import data
+from torch.utils.data import DataLoader
 
 FORMATS = 'bmp', 'dng', 'jpeg', 'jpg', 'mpo', 'png', 'tif', 'tiff', 'webp'
 
@@ -199,8 +201,18 @@ class Dataset(data.Dataset):
     @staticmethod
     def load_label(filenames):
         path = f'{os.path.dirname(filenames[0])}.cache'
+        
+        # ---------------------------------------------------------
+        # [修改處] 每次啟動都會檢查，如果存在舊的 cache 就強制刪除
+        # ---------------------------------------------------------
         if os.path.exists(path):
-            return torch.load(path)
+            os.remove(path)
+            print(f"\n[提示] 已自動刪除舊的快取檔案: {path}")
+            print("正在重新掃描並讀取最新的標籤資料...\n")
+            
+        # (原本這裡的 return torch.load(path) 就可以直接刪掉了)
+        # ---------------------------------------------------------
+
         x = {}
         for filename in filenames:
             try:
@@ -209,6 +221,8 @@ class Dataset(data.Dataset):
                     image = Image.open(f)
                     image.verify()  # PIL verify
                 shape = image.size  # image size
+                
+                # ... 下方保留你原本的驗證與讀取邏輯 ...
                 assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
                 assert image.format.lower() in FORMATS, f'invalid image format {image.format}'
 
@@ -236,6 +250,8 @@ class Dataset(data.Dataset):
             except AssertionError:
                 continue
             x[filename] = label
+            
+        # 讀取完畢後，還是會把最新的結果存成新的 cache，加速同一次訓練中的存取
         torch.save(x, path)
         return x
 
@@ -452,3 +468,38 @@ class Albumentations:
                 # 安全機制：如果 Albumentations 處理異常 (例如極端座標)，退回原圖
                 pass
         return image, box, cls
+
+
+def create_dataloader(img_folder, input_size=640, batch_size=8, augment=True, shuffle:bool=True, hyp_params=None):
+    # 2. 取得該資料夾下所有的圖片完整路徑 (filenames)
+    # 使用 glob 抓取所有 jpg/png 結尾的檔案
+    filenames = []
+    for ext in ('*.jpg', '*.jpeg', '*.png'):
+        filenames.extend(glob.glob(os.path.join(img_folder, ext)))
+    
+    if not filenames:
+        print(f"警告：在 {img_folder} 找不到任何圖片！")
+        return None
+
+    print(f"成功找到 {len(filenames)} 張圖片。")
+
+    # 3. 實例化你寫的 Dataset 類別
+    custom_dataset = Dataset(
+        filenames=filenames,
+        input_size=input_size,
+        params=hyp_params,
+        augment=augment
+    )
+
+    # 4. 包裝進 PyTorch DataLoader
+    # 非常重要：必須使用 Dataset 類別裡自帶的 collate_fn 靜態方法
+    dataloader = DataLoader(
+        custom_dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,     # 訓練時打亂，驗證時不打亂
+        num_workers=4,       # 根據你的 CPU 核心數調整
+        pin_memory=True,     # 加速傳輸到 GPU
+        collate_fn=Dataset.collate_fn  # 處理不同數量的 Bounding box
+    )
+    
+    return dataloader
