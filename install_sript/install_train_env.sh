@@ -76,5 +76,6 @@ pip install trackeval==0.1.5
 pip install opencv-python==4.11.0.86
 pip install opencv-python-headless==4.11.0.86
 pip install numpy==1.26
+pip install ultralytics
 
 echo "Done! Environment '$ENV_NAME' is ready."

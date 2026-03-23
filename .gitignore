@@ -30,3 +30,11 @@ test file/quantize_result/ResNet.py
 test file/quantize_result/__pycache__/ResNet.cpython-38.pyc
 train/utils/__pycache__/dataset.cpython-39.pyc
 train/ex.py
+train/arch/__pycache__/yolo11.cpython-38.pyc
+train/quantize_result/YOLO.py
+train/quantize_result/__pycache__/YOLO.cpython-38.pyc
+train/utils/__pycache__/util.cpython-38.pyc
+train/weights/best.pt
+train/weights/last.pt
+train/weights/step.csv
+train/yolo_library.ipynb

@@ -685,7 +685,8 @@ class ComputeLoss:
 
         self.box_loss = BoxLoss(m.ch - 1).to(device)
         self.cls_loss = torch.nn.BCEWithLogitsLoss(reduction='none')
-        self.assigner = Assigner(nc=self.nc, top_k=10, alpha=0.5, beta=6.0)
+        # self.assigner = Assigner(nc=self.nc, top_k=10, alpha=0.5, beta=6.0)
+        self.assigner = Assigner(nc=self.nc, top_k=13, alpha=0.5, beta=6.0)
 
         self.project = torch.arange(m.ch, dtype=torch.float, device=device)
 
