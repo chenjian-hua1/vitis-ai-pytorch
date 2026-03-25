@@ -26,3 +26,5 @@ train/yolo_library.ipynb
 train/arch/__pycache__/yolo11_source.cpython-39.pyc
 test file/quantize_result/*
 train/weights/*
+train/utils/__pycache__/dataset.cpython-38.pyc
+train/__pycache__/yolo_train.cpython-38.pyc

@@ -343,12 +343,12 @@ def train(args, params, dataset_config):
 # ─────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def test(args, dataset_config, model=None):
+def test(args, dataset_config, params, model=None):
     # ── Load Config ────────────────────────────────────────
     # Args
-    WEIGHTS_DIR = args.weights_dir
+    WEIGHTS_DIR = "weights"
     INPUT_SIZE  = args.input_size
-    # BATCH_SIZE  = args.batch_size
+    BATCH_SIZE  = args.batch_size
     # EPOCHS      = args.epochs
     WORKERS     = args.workers
 
@@ -364,7 +364,7 @@ def test(args, dataset_config, model=None):
     val_loader = create_dataloader(
         img_folder = VAL_IMG_DIR,
         input_size = INPUT_SIZE,
-        batch_size = 4,
+        batch_size = BATCH_SIZE,
         workers=WORKERS,
         augment    = False,
         shuffle    = False,
