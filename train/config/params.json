@@ -1,0 +1,30 @@
+{
+  "names": ["class0", "class1", "class2", "..."],
+
+  "min_lr": 1e-5,
+  "max_lr": 1e-2,
+  "momentum": 0.937,
+  "warmup_momentum": 0.8,
+  "weight_decay": 1e-4,
+  "warmup_epochs": 1,
+  "lrf": 0.01,
+
+  "box": 7.5,
+  "cls": 0.5,
+  "dfl": 1.5,
+
+  "mosaic": 1.0,
+  "mix_up": 0.1,
+  "copy_paste": 0.1,
+  "hsv_h": 0.015,
+  "hsv_s": 0.7,
+  "hsv_v": 0.4,
+  "degrees": 30.0,
+  "scale": 0.5,
+  "shear": 0.3,
+  "translate": 0.2,
+  "flip_ud": 0.0,
+  "flip_lr": 0.5,
+
+  "multi_scale": true
+}

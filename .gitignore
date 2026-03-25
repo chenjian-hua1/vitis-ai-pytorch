@@ -1,6 +1,5 @@
 test file/model/resnet18_best.pth
 test file/model/resnet18_pruned.pth
-test file/model/quantize_result/*
 train/quantize_result/*
 train/runs/*
 train/yolo26n.pt
@@ -25,3 +24,5 @@ train/utils/__pycache__/util.cpython-38.pyc
 train/weights/*
 train/yolo_library.ipynb
 train/arch/__pycache__/yolo11_source.cpython-39.pyc
+test file/quantize_result/*
+train/weights/*
