@@ -176,7 +176,7 @@ def train(args, params, dataset_config):
     INPUT_SIZE  = args.input_size
     BATCH_SIZE  = args.batch_size
     EPOCHS      = args.epochs
-    # WORKERS     = args.workers
+    WORKERS     = args.workers
 
     # Dataset
     DATASET_DIR  = dataset_config["dataset_dir"]
@@ -230,6 +230,7 @@ def train(args, params, dataset_config):
         img_folder = TRAIN_IMG_DIR,
         input_size = INPUT_SIZE,
         batch_size = BATCH_SIZE,
+        workers    = WORKERS,
         augment    = True,
         shuffle    = True,
         hyp_params = params,
@@ -349,7 +350,7 @@ def test(args, dataset_config, model=None):
     INPUT_SIZE  = args.input_size
     # BATCH_SIZE  = args.batch_size
     # EPOCHS      = args.epochs
-    # WORKERS     = args.workers
+    WORKERS     = args.workers
 
     # Dataset
     DATASET_DIR  = dataset_config["dataset_dir"]
@@ -364,6 +365,7 @@ def test(args, dataset_config, model=None):
         img_folder = VAL_IMG_DIR,
         input_size = INPUT_SIZE,
         batch_size = 4,
+        workers=WORKERS,
         augment    = False,
         shuffle    = False,
         hyp_params = params,

@@ -450,8 +450,16 @@ class Albumentations:
         return image, box, cls
 
 
-def create_dataloader(img_folder, input_size=640, batch_size=8,
-                      augment=True, shuffle=True, mosaic=False, hyp_params=None):
+def create_dataloader(
+    img_folder, 
+    input_size=640, 
+    batch_size=8,
+    workers=8,
+    augment=True, 
+    shuffle=True, 
+    mosaic=False, 
+    hyp_params=None
+):
     filenames = []
     for ext in ('*.jpg', '*.jpeg', '*.png'):
         filenames.extend(glob.glob(os.path.join(img_folder, ext)))
@@ -472,7 +480,7 @@ def create_dataloader(img_folder, input_size=640, batch_size=8,
         custom_dataset,
         batch_size  = batch_size,
         shuffle     = shuffle,
-        num_workers = 4,
+        num_workers = workers,
         pin_memory  = True,
         collate_fn  = Dataset.collate_fn,
     )
