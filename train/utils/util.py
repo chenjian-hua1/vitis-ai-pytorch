@@ -82,6 +82,42 @@ def wh2xy(x):
     return y
 
 
+# def make_anchors(x, strides, offset=0.5):
+#     assert x is not None
+#     anchor_tensor, stride_tensor = [], []
+#     dtype, device = x[0].dtype, x[0].device
+#     for i, stride in enumerate(strides):
+#         _, _, h, w = x[i].shape
+#         sx = torch.arange(end=w, device=device, dtype=dtype) + offset  # shift x
+#         sy = torch.arange(end=h, device=device, dtype=dtype) + offset  # shift y
+        
+#         # ❌ 原本
+#         # sy, sx = torch.meshgrid(sy, sx)
+
+#         # ✅ 改成 stack 展開，避免 meshgrid
+#         # sy = sy.unsqueeze(1).expand(h, w)
+#         # sx = sx.unsqueeze(0).expand(h, w)
+
+#         # repeat 取代 expand（避免 nndct_expand）
+#         sy = sy.unsqueeze(1).repeat(1, w)   # (h, w)
+#         sx = sx.unsqueeze(0).repeat(h, 1)   # (h, w)
+
+
+#         # cat 取代 stack（避免 nndct_stack）
+#         sx_flat = sx.reshape(-1, 1)
+#         sy_flat = sy.reshape(-1, 1)
+#         anchor_tensor.append(torch.cat((sx_flat, sy_flat), dim=1))
+
+#         # zeros + fill_ 取代 full（避免 aten::full）
+#         stride_tensor.append(
+#             torch.zeros(h * w, 1, dtype=dtype, device=device).fill_(stride.item())
+#         )
+
+#         # anchor_tensor.append(torch.stack((sx, sy), -1).view(-1, 2))
+#         # stride_tensor.append(torch.full((h * w, 1), stride, dtype=dtype, device=device))
+
+#     return torch.cat(anchor_tensor), torch.cat(stride_tensor)
+
 def make_anchors(x, strides, offset=0.5):
     assert x is not None
     anchor_tensor, stride_tensor = [], []
@@ -90,9 +126,33 @@ def make_anchors(x, strides, offset=0.5):
         _, _, h, w = x[i].shape
         sx = torch.arange(end=w, device=device, dtype=dtype) + offset  # shift x
         sy = torch.arange(end=h, device=device, dtype=dtype) + offset  # shift y
-        sy, sx = torch.meshgrid(sy, sx)
-        anchor_tensor.append(torch.stack((sx, sy), -1).view(-1, 2))
-        stride_tensor.append(torch.full((h * w, 1), stride, dtype=dtype, device=device))
+        
+        # repeat 取代 expand
+        sy = sy.unsqueeze(1).repeat(1, w)   # (h, w)
+        sx = sx.unsqueeze(0).repeat(h, 1)   # (h, w)
+
+        # cat 取代 stack
+        sx_flat = sx.reshape(-1, 1)
+        sy_flat = sy.reshape(-1, 1)
+        anchor_tensor.append(torch.cat((sx_flat, sy_flat), dim=1))
+
+        # -----------------------------------------------------
+        # ❌ 原本的寫法 (會觸發 aten::fill_)
+        # stride_tensor.append(
+        #     torch.zeros(h * w, 1, dtype=dtype, device=device).fill_(stride.item())
+        # )
+        
+        # ✅ 修改方案：利用現有的 sx_flat 進行基礎運算
+        # sx_flat 的 shape 剛好是 (h*w, 1)，我們把它乘以 0 清空，再加 / 乘上 stride
+        # 這樣計算圖裡只會看到 aten::mul 和 aten::add，完美避開 fill_ 和 full
+        # -----------------------------------------------------
+        stride_part = (sx_flat * 0.0) + stride.item()
+        
+        # 或者你也可以使用 ones_like，這也是編譯器通常能接受的寫法：
+        # stride_part = torch.ones_like(sx_flat) * stride.item()
+        
+        stride_tensor.append(stride_part)
+
     return torch.cat(anchor_tensor), torch.cat(stride_tensor)
 
 

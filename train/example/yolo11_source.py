@@ -1,5 +1,3 @@
-# reference : https://github.com/jahongir7174/YOLOv11-pt/blob/master/nets/nn.py
-
 import math
 
 import torch
@@ -32,20 +30,20 @@ class Conv(torch.nn.Module):
         super().__init__()
         self.conv = torch.nn.Conv2d(in_ch, out_ch, k, s, p, groups=g, bias=False)
         self.norm = torch.nn.BatchNorm2d(out_ch, eps=0.001, momentum=0.03)
-        self.ReLU = activation
+        self.relu = activation
 
     def forward(self, x):
-        return self.ReLU(self.norm(self.conv(x)))
+        return self.relu(self.norm(self.conv(x)))
 
     def fuse_forward(self, x):
-        return self.ReLU(self.conv(x))
+        return self.relu(self.conv(x))
 
 
 class Residual(torch.nn.Module):
     def __init__(self, ch, e=0.5):
         super().__init__()
-        self.conv1 = Conv(ch, int(ch * e), torch.nn.ReLU(), k=3, p=1)
-        self.conv2 = Conv(int(ch * e), ch, torch.nn.ReLU(), k=3, p=1)
+        self.conv1 = Conv(ch, int(ch * e), torch.nn.SiLU(), k=3, p=1)
+        self.conv2 = Conv(int(ch * e), ch, torch.nn.SiLU(), k=3, p=1)
 
     def forward(self, x):
         return x + self.conv2(self.conv1(x))
@@ -54,9 +52,9 @@ class Residual(torch.nn.Module):
 class CSPModule(torch.nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.conv1 = Conv(in_ch, out_ch // 2, torch.nn.ReLU())
-        self.conv2 = Conv(in_ch, out_ch // 2, torch.nn.ReLU())
-        self.conv3 = Conv(2 * (out_ch // 2), out_ch, torch.nn.ReLU())
+        self.conv1 = Conv(in_ch, out_ch // 2, torch.nn.SiLU())
+        self.conv2 = Conv(in_ch, out_ch // 2, torch.nn.SiLU())
+        self.conv3 = Conv(2 * (out_ch // 2), out_ch, torch.nn.SiLU())
         self.res_m = torch.nn.Sequential(Residual(out_ch // 2, e=1.0),
                                          Residual(out_ch // 2, e=1.0))
 
@@ -68,106 +66,33 @@ class CSPModule(torch.nn.Module):
 class CSP(torch.nn.Module):
     def __init__(self, in_ch, out_ch, n, csp, r):
         super().__init__()
-        self.conv1 = Conv(in_ch, 2 * (out_ch // r), torch.nn.ReLU())
-        self.conv2 = Conv((2 + n) * (out_ch // r), out_ch, torch.nn.ReLU())
-
-        # 🛑 關鍵：在 __init__ 先算好切片的通道數，不要在 forward 裡面算
-        self.half_ch = out_ch // r
+        self.conv1 = Conv(in_ch, 2 * (out_ch // r), torch.nn.SiLU())
+        self.conv2 = Conv((2 + n) * (out_ch // r), out_ch, torch.nn.SiLU())
 
         if not csp:
             self.res_m = torch.nn.ModuleList(Residual(out_ch // r) for _ in range(n))
         else:
             self.res_m = torch.nn.ModuleList(CSPModule(out_ch // r, out_ch // r) for _ in range(n))
 
-    # def forward(self, x):
-    #     # 原始寫法：
-    #     # y = list(self.conv1(x).chunk(2, 1))
-    #     # 修改為切片寫法：
-    #     out = self.conv1(x)
-    #     c = out.shape[1] // 2
-    #     y = [out[:, :c, :, :], out[:, c:, :, :]]
-
-    #     y.extend(m(y[-1]) for m in self.res_m)
-    #     return self.conv2(torch.cat(y, dim=1))
-
     def forward(self, x):
-        # 1. 經過第一層卷積
-        out = self.conv1(x)
-        # c = out.shape[1] // 2
-        
-        # 2. 🛑 巧妙的邏輯：out 本身就已經是 [y1, y2] 拼接好的狀態了！
-        # 我們直接把 out 當作拼接的基底 (y_cat)
-        y_cat = out 
-        
-        # 只有後半段 (y2) 會進入後續的 res_m 模組
-        last_feat = out[:, self.half_ch:, :, :]
-        
-        # 3. 🛑 滾動式拼接 (Rolling Concat)：徹底捨棄所有的 List 和 Tuple
-        for m in self.res_m:
-            last_feat = m(last_feat)
-            # 每次產生新的特徵圖，就直接 concat 到 y_cat 的後面
-            y_cat = torch.cat((y_cat, last_feat), dim=1)
-            
-        # 4. 迴圈結束後，y_cat 已經是一個包含所有特徵的純 Tensor！直接輸出
-        return self.conv2(y_cat)
+        y = list(self.conv1(x).chunk(2, 1))
+        y.extend(m(y[-1]) for m in self.res_m)
+        return self.conv2(torch.cat(y, dim=1))
 
 
 class SPP(torch.nn.Module):
     def __init__(self, in_ch, out_ch, k=5):
         super().__init__()
-        self.conv1 = Conv(in_ch, in_ch // 2, torch.nn.ReLU())
-        self.conv2 = Conv(in_ch * 2, out_ch, torch.nn.ReLU())
+        self.conv1 = Conv(in_ch, in_ch // 2, torch.nn.SiLU())
+        self.conv2 = Conv(in_ch * 2, out_ch, torch.nn.SiLU())
         self.res_m = torch.nn.MaxPool2d(k, stride=1, padding=k // 2)
 
     def forward(self, x):
         x = self.conv1(x)
         y1 = self.res_m(x)
         y2 = self.res_m(y1)
-        # 🛑 關鍵：先把 y3 算出來！
-        y3 = self.res_m(y2)
-        return self.conv2(torch.cat(tensors=(x, y1, y2, y3), dim=1))
+        return self.conv2(torch.cat(tensors=[x, y1, y2, self.res_m(y2)], dim=1))
 
-class ConvAttention(torch.nn.Module):
-    """
-    用純卷積 (Conv) 與池化 (Pool) 構建的 Attention 機制。
-    保證 100% 通過 Vitis AI XIR 編譯器，且運算極度硬體友善。
-    """
-    def __init__(self, ch, num_head=None): # 保留 num_head 參數以相容你原本的呼叫
-        super().__init__()
-        
-        # 1. 通道注意力 (Channel Attention)：用 1x1 卷積取代 Linear/Matmul
-        self.avg_pool = torch.nn.AdaptiveAvgPool2d(1)
-        self.conv_c1 = torch.nn.Conv2d(ch, ch // 2, kernel_size=1, bias=False)
-        self.ReLU = torch.nn.ReLU()
-        self.conv_c2 = torch.nn.Conv2d(ch // 2, ch, kernel_size=1, bias=False)
-        
-        # 2. 空間特徵融合 (Spatial Mixing)：用大核的 Depthwise 卷積取代全局 QxK 運算
-        # kernel_size=5, padding=2 可以捕捉更大的感受野，達到類似 Attention 的效果
-        self.dwconv = torch.nn.Conv2d(ch, ch, kernel_size=5, padding=2, groups=ch, bias=False)
-        
-        # 3. 輸出映射
-        self.conv_out = torch.nn.Conv2d(ch, ch, kernel_size=1, bias=False)
-
-    def forward(self, x):
-        # --- 通道注意力分支 ---
-        # 透過 Global Average Pooling 取得全局資訊，再用 1x1 卷積算出通道權重
-        y = self.avg_pool(x)
-        y = self.conv_c1(y)
-        y = self.ReLU(y)
-        y = self.conv_c2(y)
-        
-        # 用 Sigmoid 將權重限縮在 0~1 之間 (這是 DPU 支援的操作)
-        attn_weights = y.sigmoid()
-        
-        # 將權重乘回原特徵圖 (Element-wise Multiplication，DPU 完全支援)
-        out = x * attn_weights
-        
-        # --- 空間特徵分支 ---
-        # 透過 Depthwise 卷積進行相鄰像素的特徵融合，彌補失去 QK 矩陣相乘的空間感知力
-        out = self.dwconv(out)
-        
-        # 最後整理通道輸出
-        return self.conv_out(out)
 
 class Attention(torch.nn.Module):
 
@@ -177,8 +102,6 @@ class Attention(torch.nn.Module):
         self.dim_head = ch // num_head
         self.dim_key = self.dim_head // 2
         self.scale = self.dim_key ** -0.5
-        self.layer_param0 = self.dim_key * 2 + self.dim_head
-        self.layer_param1 = self.dim_key * 2
 
         self.qkv = Conv(ch, ch + self.dim_key * num_head * 2, torch.nn.Identity())
 
@@ -189,28 +112,14 @@ class Attention(torch.nn.Module):
         b, c, h, w = x.shape
 
         qkv = self.qkv(x)
+        qkv = qkv.view(b, self.num_head, self.dim_key * 2 + self.dim_head, h * w)
 
-        # ❌ h * w 是 Python int，某些版本會產生 int64 中間值
-        # qkv = qkv.view(b, self.num_head, self.dim_key * 2 + self.dim_head, h * w)
-        # ✅ 改用 -1 讓 PyTorch 自動推斷
-        qkv = qkv.view(b, self.num_head, self.layer_param, -1)
-
-
-        # ❌ 原本：split 產生 nndct_stack
-        # q, k, v = qkv.split([self.dim_key, self.dim_key, self.dim_head], dim=2)
-        # ✅ 改成 chunk 或 narrow，量化器更好追蹤
-        q = qkv[:, :, :self.dim_key, :]
-        k = qkv[:, :, self.dim_key:self.layer_param1, :]
-        v = qkv[:, :, self.layer_param1:, :]
+        q, k, v = qkv.split([self.dim_key, self.dim_key, self.dim_head], dim=2)
 
         attn = (q.transpose(-2, -1) @ k) * self.scale
         attn = attn.softmax(dim=-1)
 
-        # ❌ 原本
-        # x = (v @ attn.transpose(-2, -1)).view(b, c, h, w) + self.conv1(v.reshape(b, c, h, w))
-        # ✅ reshape 也用 -1
-        x = (v @ attn.transpose(-2, -1)).view(b, c, h, w) + self.conv1(v.reshape(b, c, -1).reshape(b, c, h, w))
-
+        x = (v @ attn.transpose(-2, -1)).view(b, c, h, w) + self.conv1(v.reshape(b, c, h, w))
         return self.conv2(x)
 
 
@@ -219,31 +128,23 @@ class PSABlock(torch.nn.Module):
     def __init__(self, ch, num_head):
         super().__init__()
         self.conv1 = Attention(ch, num_head)
-        self.conv2 = torch.nn.Sequential(Conv(ch, ch * 2, torch.nn.ReLU()),
+        self.conv2 = torch.nn.Sequential(Conv(ch, ch * 2, torch.nn.SiLU()),
                                          Conv(ch * 2, ch, torch.nn.Identity()))
 
     def forward(self, x):
-        # x = x + self.conv1(x)
+        x = x + self.conv1(x)
         return x + self.conv2(x)
 
 
 class PSA(torch.nn.Module):
     def __init__(self, ch, n):
         super().__init__()
-        self.conv1 = Conv(ch, 2 * (ch // 2), torch.nn.ReLU())
-        self.conv2 = Conv(2 * (ch // 2), ch, torch.nn.ReLU())
-        # 🛑 關鍵：在 __init__ 算好通道數
-        self.half_ch = ch // 2
+        self.conv1 = Conv(ch, 2 * (ch // 2), torch.nn.SiLU())
+        self.conv2 = Conv(2 * (ch // 2), ch, torch.nn.SiLU())
         self.res_m = torch.nn.Sequential(*(PSABlock(ch // 2, ch // 128) for _ in range(n)))
 
     def forward(self, x):
-        # 原始寫法：
-        # x, y = self.conv1(x).chunk(2, 1)
-        # 修改為切片寫法：
-        out = self.conv1(x)
-        # c = out.shape[1] // 2
-        x, y = out[:, :self.half_ch, :, :], out[:, self.half_ch:, :, :]
-        
+        x, y = self.conv1(x).chunk(2, 1)
         return self.conv2(torch.cat(tensors=(x, self.res_m(y)), dim=1))
 
 
@@ -257,18 +158,18 @@ class DarkNet(torch.nn.Module):
         self.p5 = []
 
         # p1/2
-        self.p1.append(Conv(width[0], width[1], torch.nn.ReLU(), k=3, s=2, p=1))
+        self.p1.append(Conv(width[0], width[1], torch.nn.SiLU(), k=3, s=2, p=1))
         # p2/4
-        self.p2.append(Conv(width[1], width[2], torch.nn.ReLU(), k=3, s=2, p=1))
+        self.p2.append(Conv(width[1], width[2], torch.nn.SiLU(), k=3, s=2, p=1))
         self.p2.append(CSP(width[2], width[3], depth[0], csp[0], r=4))
         # p3/8
-        self.p3.append(Conv(width[3], width[3], torch.nn.ReLU(), k=3, s=2, p=1))
+        self.p3.append(Conv(width[3], width[3], torch.nn.SiLU(), k=3, s=2, p=1))
         self.p3.append(CSP(width[3], width[4], depth[1], csp[0], r=4))
         # p4/16
-        self.p4.append(Conv(width[4], width[4], torch.nn.ReLU(), k=3, s=2, p=1))
+        self.p4.append(Conv(width[4], width[4], torch.nn.SiLU(), k=3, s=2, p=1))
         self.p4.append(CSP(width[4], width[4], depth[2], csp[1], r=2))
         # p5/32
-        self.p5.append(Conv(width[4], width[5], torch.nn.ReLU(), k=3, s=2, p=1))
+        self.p5.append(Conv(width[4], width[5], torch.nn.SiLU(), k=3, s=2, p=1))
         self.p5.append(CSP(width[5], width[5], depth[3], csp[1], r=2))
         self.p5.append(SPP(width[5], width[5]))
         self.p5.append(PSA(width[5], depth[4]))
@@ -294,44 +195,17 @@ class DarkFPN(torch.nn.Module):
         self.up = torch.nn.Upsample(scale_factor=2)
         self.h1 = CSP(width[4] + width[5], width[4], depth[5], csp[0], r=2)
         self.h2 = CSP(width[4] + width[4], width[3], depth[5], csp[0], r=2)
-        self.h3 = Conv(width[3], width[3], torch.nn.ReLU(), k=3, s=2, p=1)
+        self.h3 = Conv(width[3], width[3], torch.nn.SiLU(), k=3, s=2, p=1)
         self.h4 = CSP(width[3] + width[4], width[4], depth[5], csp[0], r=2)
-        self.h5 = Conv(width[4], width[4], torch.nn.ReLU(), k=3, s=2, p=1)
+        self.h5 = Conv(width[4], width[4], torch.nn.SiLU(), k=3, s=2, p=1)
         self.h6 = CSP(width[4] + width[5], width[5], depth[5], csp[1], r=2)
 
-    # def forward(self, p3, p4, p5):
-    #     # p3, p4, p5 = x
-    #     # p4 = self.h1(torch.cat(tensors=[self.up(p5), p4], dim=1))
-    #     # p3 = self.h2(torch.cat(tensors=[self.up(p4), p3], dim=1))
-    #     # p4 = self.h4(torch.cat(tensors=[self.h3(p3), p4], dim=1))
-    #     # p5 = self.h6(torch.cat(tensors=[self.h5(p4), p5], dim=1))
-
-    #     p4 = self.h1(torch.cat(tensors=(self.up(p5), p4), dim=1))
-    #     p3 = self.h2(torch.cat(tensors=(self.up(p4), p3), dim=1))
-    #     p4 = self.h4(torch.cat(tensors=(self.h3(p3), p4), dim=1))
-    #     p5 = self.h6(torch.cat(tensors=(self.h5(p4), p5), dim=1))
-
-    #     return p3, p4, p5
-    
-    def forward(self, p3, p4, p5):
-        # 🛑 關鍵：把每一個運算都獨立成一行，清清楚楚，不要有任何巢狀函數
-        
-        up_p5 = self.up(p5)
-        cat_p4 = torch.cat((up_p5, p4), dim=1)
-        p4 = self.h1(cat_p4)
-
-        up_p4 = self.up(p4)
-        cat_p3 = torch.cat((up_p4, p3), dim=1)
-        p3 = self.h2(cat_p3)
-
-        h3_p3 = self.h3(p3)
-        cat_p4_2 = torch.cat((h3_p3, p4), dim=1)
-        p4 = self.h4(cat_p4_2)
-
-        h5_p4 = self.h5(p4)
-        cat_p5 = torch.cat((h5_p4, p5), dim=1)
-        p5 = self.h6(cat_p5)
-
+    def forward(self, x):
+        p3, p4, p5 = x
+        p4 = self.h1(torch.cat(tensors=[self.up(p5), p4], dim=1))
+        p3 = self.h2(torch.cat(tensors=[self.up(p4), p3], dim=1))
+        p4 = self.h4(torch.cat(tensors=[self.h3(p3), p4], dim=1))
+        p5 = self.h6(torch.cat(tensors=[self.h5(p4), p5], dim=1))
         return p3, p4, p5
 
 
@@ -347,11 +221,6 @@ class DFL(torch.nn.Module):
 
     def forward(self, x):
         b, c, a = x.shape
-        # 1. 避免使用 x.shape 解包
-        # b = x.size(0)
-        # a = x.size(2)
-        # b = int(x.shape[0])
-        # a = int(x.shape[2])
         x = x.view(b, 4, self.ch, a).transpose(2, 1)
         return self.conv(x.softmax(1)).view(b, 4, a)
 
@@ -391,8 +260,6 @@ class YOLOPostProcessor(torch.nn.Module):
         box = torch.cat(tensors=((a + b) / 2, b - a), dim=1)
 
         return torch.cat(tensors=(box * self.strides, cls.sigmoid()), dim=1)
-
-        
     
 
 class Head(torch.nn.Module):
@@ -410,53 +277,34 @@ class Head(torch.nn.Module):
         box = max(64, filters[0] // 4)
         cls = max(80, filters[0], self.nc)
 
-        # self.dfl = DFL(self.ch)
-        self.box = torch.nn.ModuleList(torch.nn.Sequential(Conv(x, box,torch.nn.ReLU(), k=3, p=1),
-                                                           Conv(box, box,torch.nn.ReLU(), k=3, p=1),
+        self.dfl = DFL(self.ch)
+        self.box = torch.nn.ModuleList(torch.nn.Sequential(Conv(x, box,torch.nn.SiLU(), k=3, p=1),
+                                                           Conv(box, box,torch.nn.SiLU(), k=3, p=1),
                                                            torch.nn.Conv2d(box, out_channels=4 * self.ch,
                                                                            kernel_size=1)) for x in filters)
-        self.cls = torch.nn.ModuleList(torch.nn.Sequential(Conv(x, x, torch.nn.ReLU(), k=3, p=1, g=x),
-                                                           Conv(x, cls, torch.nn.ReLU()),
-                                                           Conv(cls, cls, torch.nn.ReLU(), k=3, p=1, g=cls),
-                                                           Conv(cls, cls, torch.nn.ReLU()),
+        self.cls = torch.nn.ModuleList(torch.nn.Sequential(Conv(x, x, torch.nn.SiLU(), k=3, p=1, g=x),
+                                                           Conv(x, cls, torch.nn.SiLU()),
+                                                           Conv(cls, cls, torch.nn.SiLU(), k=3, p=1, g=cls),
+                                                           Conv(cls, cls, torch.nn.SiLU()),
                                                            torch.nn.Conv2d(cls, out_channels=self.nc,
                                                                            kernel_size=1)) for x in filters)
 
-    # def forward(self, x):
-    #     for i, (box, cls) in enumerate(zip(self.box, self.cls)):
-    #         x[i] = torch.cat(tensors=(box(x[i]), cls(x[i])), dim=1)
-    #     if self.training:
-    #         return x
+    def forward(self, x):
+        for i, (box, cls) in enumerate(zip(self.box, self.cls)):
+            x[i] = torch.cat(tensors=(box(x[i]), cls(x[i])), dim=1)
+        # if self.training:
+        return x
 
-    #     self.anchors, self.strides = (i.transpose(0, 1) for i in make_anchors(x, self.stride))
-    #     x = torch.cat([i.view(x[0].shape[0], self.no, -1) for i in x], dim=2)
-    #     box, cls = x.split(split_size=(4 * self.ch, self.nc), dim=1)
+        # self.anchors, self.strides = (i.transpose(0, 1) for i in make_anchors(x, self.stride))
+        # x = torch.cat([i.view(x[0].shape[0], self.no, -1) for i in x], dim=2)
+        # box, cls = x.split(split_size=(4 * self.ch, self.nc), dim=1)
 
-    #     a, b = self.dfl(box).chunk(2, 1)
-    #     a = self.anchors.unsqueeze(0) - a
-    #     b = self.anchors.unsqueeze(0) + b
-    #     box = torch.cat(tensors=((a + b) / 2, b - a), dim=1)
+        # a, b = self.dfl(box).chunk(2, 1)
+        # a = self.anchors.unsqueeze(0) - a
+        # b = self.anchors.unsqueeze(0) + b
+        # box = torch.cat(tensors=((a + b) / 2, b - a), dim=1)
 
-    #     return torch.cat(tensors=(box * self.strides, cls.sigmoid()), dim=1)
-    
-    # 🛑 關鍵：參數改為接收 p3, p4, p5，而不是單一的 x
-    def forward(self, p3, p4, p5):
-        # 第一層 (P3)
-        box0 = self.box[0](p3)
-        cls0 = self.cls[0](p3)
-        out0 = torch.cat((box0, cls0), dim=1)
-        
-        # 第二層 (P4)
-        box1 = self.box[1](p4)
-        cls1 = self.cls[1](p4)
-        out1 = torch.cat((box1, cls1), dim=1)
-        
-        # 第三層 (P5)
-        box2 = self.box[2](p5)
-        cls2 = self.cls[2](p5)
-        out2 = torch.cat((box2, cls2), dim=1)
-        
-        return out0, out1, out2
+        # return torch.cat(tensors=(box * self.strides, cls.sigmoid()), dim=1)
 
     def initialize_biases(self):
         # Initialize biases
@@ -480,20 +328,10 @@ class YOLO(torch.nn.Module):
         self.stride = self.head.stride
         self.head.initialize_biases()
 
-    # def forward(self, x):
-    #     x = self.net(x)
-    #     x = self.fpn(x)
-    #     # return self.head(list(x))
-    #     return self.head(x)
-
     def forward(self, x):
-        p3, p4, p5 = self.net(x)  # 從 Backbone 取得 3 個獨立的 Tensor
-        
-        # 🛑 關鍵：不要傳 tuple(x)，而是把 3 個 Tensor 獨立傳進去！
-        p3, p4, p5 = self.fpn(p3, p4, p5) 
-        
-        # 🛑 關鍵：Head 也接收 3 個獨立的 Tensor
-        return self.head(p3, p4, p5)
+        x = self.net(x)
+        x = self.fpn(x)
+        return self.head(list(x))
 
     def fuse(self):
         for m in self.modules():

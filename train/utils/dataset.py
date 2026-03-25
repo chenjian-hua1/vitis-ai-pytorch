@@ -171,9 +171,9 @@ class Dataset(data.Dataset):
     @staticmethod
     def load_label(filenames):
         path = f'{os.path.dirname(filenames[0])}.cache'
-        if os.path.exists(path):
-            os.remove(path)
-            print(f"\n[提示] 已自動刪除舊的快取檔案: {path}")
+        # if os.path.exists(path):
+        #     os.remove(path)
+        #     print(f"\n[提示] 已自動刪除舊的快取檔案: {path}")
 
         x = {}
         for filename in filenames:
@@ -459,8 +459,6 @@ def create_dataloader(img_folder, input_size=640, batch_size=8,
     if not filenames:
         print(f"警告：在 {img_folder} 找不到任何圖片！")
         return None
-
-    # print(f"成功找到 {len(filenames)} 張圖片。")
 
     custom_dataset = Dataset(
         filenames  = filenames,

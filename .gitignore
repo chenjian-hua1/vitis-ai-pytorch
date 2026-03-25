@@ -38,3 +38,5 @@ train/weights/best.pt
 train/weights/last.pt
 train/weights/step.csv
 train/yolo_library.ipynb
+train/arch/__pycache__/yolo11_source.cpython-39.pyc
+train/quantize_result/YOLO_int.xmodel
