@@ -1,13 +1,11 @@
 test file/model/resnet18_best.pth
 test file/model/resnet18_pruned.pth
+test file/model/quantize_result/*
+train/quantize_result/*
 train/runs/*
 train/yolo26n.pt
 train/track_out.mp4
-train/quantize_result/__pycache__/DetectionModel.cpython-38.pyc
-train/quantize_result/DetectionModel.py
-train/quantize_result/bias_corr.pth
 .vscode/settings.json
-train/quantize_result/quant_info.json
 train/arch/__pycache__/yolo11.cpython-39.pyc
 train/utils/__pycache__/util.cpython-39.pyc
 install_sript/condaenv.lp_zbqz9.requirements.txt
@@ -20,23 +18,10 @@ test file/kv26_dpu/md5sum.txt
 test file/resnet18_best.pth
 test file/resnet18_pruned.pth
 test file/kv26_dpu/meta.json
-test file/quantize_result/bias_corr.pth
-test file/quantize_result/inspect_DPUCZDX8G_ISA1_B4096.txt
-test file/quantize_result/quant_info.json
-test file/quantize_result/ResNet_int.onnx
-test file/quantize_result/ResNet_int.pt
-test file/quantize_result/ResNet_int.xmodel
-test file/quantize_result/ResNet.py
-test file/quantize_result/__pycache__/ResNet.cpython-38.pyc
 train/utils/__pycache__/dataset.cpython-39.pyc
 train/ex.py
 train/arch/__pycache__/yolo11.cpython-38.pyc
-train/quantize_result/YOLO.py
-train/quantize_result/__pycache__/YOLO.cpython-38.pyc
 train/utils/__pycache__/util.cpython-38.pyc
-train/weights/best.pt
-train/weights/last.pt
-train/weights/step.csv
+train/weights/*
 train/yolo_library.ipynb
 train/arch/__pycache__/yolo11_source.cpython-39.pyc
-train/quantize_result/YOLO_int.xmodel
