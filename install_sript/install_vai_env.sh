@@ -119,11 +119,12 @@ conda activate "$ENV_NAME"
 conda install xnnc -y
 
 # ==============================
-# Install PyTorch & YOLO
+# Install PyTorch
 # ==============================
 pip install torch==1.13.1+cu117 torchvision==0.14.1+cu117 \
     --extra-index-url https://download.pytorch.org/whl/cu117
-pip install ultralytics
+pip install albumentations
+# pip install ultralytics
 
 # ==============================
 # Copy Vitis AI arch

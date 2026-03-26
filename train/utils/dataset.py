@@ -436,7 +436,7 @@ class Albumentations:
                 )
             )
         except ImportError:
-            print("警告: 尚未安裝 albumentations，將跳過進階數據增強。")
+            print("[Warning] albumentations is not installed. Advanced data augmentation will be skipped.")
 
     def __call__(self, image, box, cls):
         if self.transform and len(box) > 0:
@@ -465,7 +465,7 @@ def create_dataloader(
         filenames.extend(glob.glob(os.path.join(img_folder, ext)))
 
     if not filenames:
-        print(f"警告：在 {img_folder} 找不到任何圖片！")
+        print(f"[Warning] No images found in {img_folder}!")
         return None
 
     custom_dataset = Dataset(

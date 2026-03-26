@@ -28,3 +28,5 @@ test file/quantize_result/*
 train/weights/*
 train/utils/__pycache__/dataset.cpython-38.pyc
 train/__pycache__/yolo_train.cpython-38.pyc
+train/xmodel_graph
+train/xmodel_graph.pdf

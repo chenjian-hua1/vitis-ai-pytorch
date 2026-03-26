@@ -44,6 +44,10 @@ import argparse
 import torch
 from tqdm import tqdm
 
+
+YELLOW = "\033[33m"
+RESET  = "\033[0m"
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ─────────────────────────────────────────────
@@ -262,9 +266,9 @@ def load_model(model_path, model_class=None, num_classes=None):
         model = get_custom_model(model_class, num_classes=num_classes)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
-            print(f"[WARNING] Missing keys:             {missing}")
+            print(f"{YELLOW}[WARNING] Missing keys:             {missing}{RESET}")
         if unexpected:
-            print(f"[WARNING] Unexpected keys (ignored): {unexpected}")
+            print(f"{YELLOW}[WARNING] Unexpected keys (ignored): {unexpected}{RESET}")
         print("[INFO] Loaded as state_dict.")
         return model.float().cpu()
 
@@ -309,9 +313,11 @@ def quantization():
     # deploy constraints
     if quant_mode != 'test' and deploy:
         deploy = False
-        print("[WARNING] Exporting xmodel only works in test mode. deploy disabled.")
+        print(f"{YELLOW}[WARNING] Exporting xmodel only works in test mode. deploy disabled.{RESET}")
     if deploy and (batch_size != 1 or subset_len != 1):
-        print("[WARNING] Exporting xmodel requires batch_size=1, subset_len=1. Adjusting.")
+        print(f"{YELLOW}[WARNING] Exporting xmodel requires batch_size=1, subset_len=1. Adjusting.{RESET}")
+        args.batch_size = 1
+        args.subset_len = 1
         batch_size = 1
         subset_len = 1
 
