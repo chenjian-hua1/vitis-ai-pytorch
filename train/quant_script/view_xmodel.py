@@ -148,6 +148,37 @@ def tensor_dtype(t) -> str:
     return "unknown"
 
 
+def get_ops_sorted(graph) -> list:
+    """
+    Return all ops in topological order, working across XIR versions.
+
+    XIR API differences:
+      - graph.get_ops()                  – unordered, available on xir.Graph
+      - root_subgraph.topological_sort() – ordered, available on xir.Subgraph
+      - graph.topological_sort()         – only exists in some older builds
+
+    We try each variant in order and fall back gracefully.
+    """
+    # Preferred: topological order from root subgraph
+    try:
+        root = graph.get_root_subgraph()
+        return list(root.topological_sort())
+    except Exception:
+        pass
+
+    # Fallback: topological_sort directly on graph (older XIR)
+    try:
+        return list(graph.topological_sort())
+    except Exception:
+        pass
+
+    # Last resort: unordered op list from graph
+    try:
+        return list(graph.get_ops())
+    except Exception:
+        return []
+
+
 # ==============================================================================
 # Core inspection functions
 # ==============================================================================
@@ -180,7 +211,7 @@ def show_ops(graph, show_attrs: bool = False, show_tensors: bool = False) -> Non
         show_tensors: When True, print detailed input tensor information.
     """
     section("Op List (Topological Order)")
-    ops = graph.topological_sort()
+    ops = get_ops_sorted(graph)
 
     for i, op in enumerate(ops):
         op_name    = op.get_name()
@@ -403,7 +434,7 @@ def export_dot(graph, dot_path: str) -> None:
         graph    : xir.Graph object.
         dot_path : Destination file path for the DOT output.
     """
-    ops = graph.topological_sort()
+    ops = get_ops_sorted(graph)
 
     def node_id(name: str) -> str:
         """Wrap a node name in quotes, escaping any internal quote characters."""
