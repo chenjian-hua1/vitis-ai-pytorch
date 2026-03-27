@@ -319,17 +319,29 @@ def show_subgraphs(graph, show_attrs: bool = False) -> None:
 
         return "-"
 
-    def _print_subgraph(sg, depth: int = 0) -> None:
-        """Recursively print the subgraph tree."""
+    def _print_subgraph(sg, depth: int = 0, inherited_device: str = "-") -> None:
+        """
+        Recursively print the subgraph tree.
+
+        Leaf subgraphs inside a DPU partition do not carry their own
+        'device' attribute; the attribute is only set on the direct
+        children of root.  We pass the parent's device value down so
+        every node in the tree shows a meaningful device label.
+        """
         indent    = "  " * depth
         name      = sg.get_name()
         op_num    = sg.get_op_num()
         child_num = len(sg.get_children())
 
-        device = _get_device(sg)
+        own_device = _get_device(sg)
+        # Use own device if found, otherwise inherit from parent
+        device = own_device if own_device != "-" else inherited_device
+
+        # Mark inherited values so the user knows it came from the parent
+        device_label = device if own_device != "-" else f"{device} (inherited)"
 
         print(f"{indent}> {name}")
-        print(f"{indent}  op_num={op_num}  children={child_num}  device={device}")
+        print(f"{indent}  op_num={op_num}  children={child_num}  device={device_label}")
 
         if show_attrs:
             attrs = safe_attrs(sg)
@@ -339,7 +351,7 @@ def show_subgraphs(graph, show_attrs: bool = False) -> None:
                         print(f"{indent}  attr: {k} = {v}")
 
         for child in sg.get_children():
-            _print_subgraph(child, depth + 1)
+            _print_subgraph(child, depth + 1, inherited_device=device)
 
     _print_subgraph(root)
 
@@ -419,55 +431,175 @@ def show_io_tensors(graph) -> None:
 # Graphviz DOT export
 # ==============================================================================
 
-def export_dot(graph, dot_path: str) -> None:
+def export_dot(graph, dot_path: str, rankdir: str = "LR") -> None:
     """
-    Export the computation graph as a Graphviz DOT file.
+    Export the computation graph as a Graphviz DOT file with device clusters.
 
-    Each node represents one Op (labelled with name, type, and output shape).
-    Directed edges represent data flow between ops.
+    Ops are grouped into labelled, colour-coded cluster boxes according to
+    which device their parent subgraph is assigned to:
 
-    The resulting DOT file can be rendered with:
+        DPU   -> blue   (#AED6F1)
+        CPU   -> orange (#FAD7A0)
+        USER  -> green  (#A9DFBF)
+        other -> grey   (#D5D8DC)
+
+    Each node is labelled with:  op_name / [op_type] / output_shape
+
+    Render with:
+        dot -Tsvg output.dot -o graph.svg   (recommended for large graphs)
         dot -Tpng output.dot -o graph.png
-        dot -Tsvg output.dot -o graph.svg
 
     Args:
         graph    : xir.Graph object.
         dot_path : Destination file path for the DOT output.
     """
-    ops = get_ops_sorted(graph)
+
+    # ── device colour palette ─────────────────────────────────────────────────
+    DEVICE_STYLE: dict = {
+        "DPU":     {"fillcolor": "#AED6F1", "color": "#1A5276"},  # blue
+        "CPU":     {"fillcolor": "#FAD7A0", "color": "#784212"},  # orange
+        "USER":    {"fillcolor": "#A9DFBF", "color": "#1E8449"},  # green
+        "DEFAULT": {"fillcolor": "#D5D8DC", "color": "#616A6B"},  # grey
+    }
 
     def node_id(name: str) -> str:
-        """Wrap a node name in quotes, escaping any internal quote characters."""
-        return '"' + name.replace('"', '\\"') + '"'
+        """Escape and quote a name for use as a DOT node identifier."""
+        return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
+    def get_device_key(device_str: str) -> str:
+        """Normalise a device string to one of the palette keys."""
+        d = device_str.upper().split("(")[0].strip()   # strip "(inherited)"
+        for key in ("DPU", "CPU", "USER"):
+            if key in d:
+                return key
+        return "DEFAULT"
+
+    # ── build op -> device mapping via subgraph tree ──────────────────────────
+    op_device: dict = {}   # op_name -> device key
+
+    def _walk(sg, inherited: str = "DEFAULT") -> None:
+        """Walk the subgraph tree and record each op's effective device."""
+        # Determine this subgraph's own device
+        own = "DEFAULT"
+        for key in ("device", "device_core_id"):
+            try:
+                if sg.has_attr(key):
+                    val = sg.get_attr(key)
+                    if val not in (None, ""):
+                        own = get_device_key(str(val))
+                        break
+            except Exception:
+                pass
+        if own == "DEFAULT":
+            try:
+                val = sg.device          # type: ignore[attr-defined]
+                if val not in (None, ""):
+                    own = get_device_key(str(val))
+            except Exception:
+                pass
+
+        effective = own if own != "DEFAULT" else inherited
+
+        children = sg.get_children()
+        if children:
+            for child in children:
+                _walk(child, inherited=effective)
+        else:
+            # Leaf subgraph: assign its ops to the effective device
+            try:
+                for op in sg.get_ops():
+                    op_device[op.get_name()] = effective
+            except Exception:
+                pass
+
+    try:
+        _walk(graph.get_root_subgraph())
+    except Exception:
+        pass
+
+    # Ops that were not reached by the subgraph walk keep DEFAULT
+    all_ops = get_ops_sorted(graph)
+    for op in all_ops:
+        op_device.setdefault(op.get_name(), "DEFAULT")
+
+    # ── group ops by device, preserving topological order within each group ───
+    from collections import defaultdict
+    device_ops: dict = defaultdict(list)
+    for op in all_ops:
+        device_ops[op_device[op.get_name()]].append(op)
+
+    # ── build DOT source ──────────────────────────────────────────────────────
     lines = [
         "digraph xmodel {",
-        "  rankdir=TB;",
-        '  node [shape=box, style=filled, fillcolor="#AED6F1", '
-        'fontname="Arial", fontsize=10];',
-        "  edge [fontsize=9];",
+        f"  rankdir={rankdir};",
+        '  graph [fontname="Arial", fontsize=12, bgcolor="white"];',
+        '  node  [fontname="Arial", fontsize=9, style=filled, shape=box];',
+        '  edge  [fontsize=8, color="#555555"];',
         "",
     ]
 
-    # Declare all nodes
-    for op in ops:
-        label = f"{op.get_name()}\\n[{op.get_type()}]"
-        out_t = op.get_output_tensor()
-        if out_t:
-            label += f"\\n{tensor_shape(out_t)}"
-        lines.append(f"  {node_id(op.get_name())} [label={node_id(label)}];")
+    # One cluster per device
+    for cluster_idx, (dev_key, ops) in enumerate(device_ops.items()):
+        style  = DEVICE_STYLE.get(dev_key, DEVICE_STYLE["DEFAULT"])
+        fc     = style["fillcolor"]
+        bc     = style["color"]
+        label  = dev_key if dev_key != "DEFAULT" else "UNKNOWN"
 
-    lines.append("")
+        lines.append(f"  subgraph cluster_{cluster_idx} {{")
+        lines.append(f'    label     = "Device: {label}";')
+        lines.append(f'    style     = filled;')
+        lines.append(f'    fillcolor = "{fc}44";')   # transparent fill for cluster bg
+        lines.append(f'    color     = "{bc}";')
+        lines.append(f'    fontcolor = "{bc}";')
+        lines.append(f'    fontname  = "Arial Bold";')
+        lines.append(f'    fontsize  = 11;')
+        lines.append("")
 
-    # Declare all edges
-    for op in ops:
+        for op in ops:
+            op_name = op.get_name()
+            op_type = op.get_type()
+            out_t   = op.get_output_tensor()
+            shape   = tensor_shape(out_t) if out_t else "-"
+
+            # Short display name: last segment after "__"
+            short_name = op_name.split("__")[-1] if "__" in op_name else op_name
+
+            # Use HTML-like label so <BR/> produces real line breaks in SVG/PNG.
+            # Characters that need escaping inside HTML labels: & < >
+            def _esc(s: str) -> str:
+                return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+            html_label = (
+                f'<<FONT POINT-SIZE="9"><B>{_esc(short_name)}</B><BR/>'
+                f'<FONT COLOR="#444444">[{_esc(op_type)}]</FONT><BR/>'
+                f'<FONT COLOR="#666666">{_esc(shape)}</FONT></FONT>>'
+            )
+
+            lines.append(
+                f'    {node_id(op_name)} ['
+                f'label={html_label}, '
+                f'fillcolor="{fc}", '
+                f'color="{bc}"'
+                f'];'
+            )
+
+        lines.append("  }")
+        lines.append("")
+
+    # All edges (drawn outside clusters so cross-device arrows render correctly)
+    lines.append("  // Edges")
+    for op in all_ops:
         try:
             in_ops_dict = op.get_input_ops()
             for _, in_op_list in in_ops_dict.items():
                 for in_op in in_op_list:
+                    src_dev = op_device.get(in_op.get_name(), "DEFAULT")
+                    dst_dev = op_device.get(op.get_name(),    "DEFAULT")
+                    # Cross-device edges get a distinct colour
+                    edge_color = "#E74C3C" if src_dev != dst_dev else "#555555"
                     lines.append(
-                        f"  {node_id(in_op.get_name())} -> "
-                        f"{node_id(op.get_name())};"
+                        f'  {node_id(in_op.get_name())} -> {node_id(op.get_name())} '
+                        f'[color="{edge_color}"];'
                     )
         except Exception:
             pass
@@ -478,8 +610,10 @@ def export_dot(graph, dot_path: str) -> None:
         f.write("\n".join(lines))
 
     print(f"\n  [DOT] Exported to : {dot_path}")
-    print(f"  [DOT] Render PNG  : dot -Tpng {dot_path} -o graph.png")
     print(f"  [DOT] Render SVG  : dot -Tsvg {dot_path} -o graph.svg")
+    print(f"  [DOT] Render PNG  : dot -Tpng {dot_path} -o graph.png")
+    print(f"  [DOT] Legend      : blue=DPU  orange=CPU  green=USER  "
+          f"grey=unknown  red-edge=cross-device")
 
 
 # ==============================================================================
@@ -529,6 +663,13 @@ Examples:
         metavar="FILE",
         help="Export the computation graph to a Graphviz DOT file."
     )
+    parser.add_argument(
+        "--rankdir",
+        choices=["LR", "TB", "RL", "BT"],
+        default="LR",
+        help="Graph layout direction: LR=landscape (default), TB=portrait, "
+             "RL=right-to-left, BT=bottom-to-top."
+    )
     return parser.parse_args()
 
 
@@ -558,7 +699,7 @@ def main():
         show_ops(graph, show_attrs=args.attrs, show_tensors=args.tensors)
 
     if args.dot:
-        export_dot(graph, args.dot)
+        export_dot(graph, args.dot, rankdir=args.rankdir)
 
     print(f"\n{SEP_MAJOR}")
     print(f"  Done.")
