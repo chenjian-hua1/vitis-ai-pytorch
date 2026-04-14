@@ -10,7 +10,7 @@ mkdir -p "$OUT_DIR"
 CXXFLAGS=$(pkg-config --cflags opencv4)
 LIBS=$(pkg-config --libs opencv4)
 
-/usr/bin/clang++ \
+/usr/bin/g++ \
     -fcolor-diagnostics \
     -fansi-escape-codes \
     -g \
