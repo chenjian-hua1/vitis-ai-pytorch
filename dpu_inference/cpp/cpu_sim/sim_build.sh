@@ -13,7 +13,8 @@ mkdir -p "$OUT_DIR"
 
 # ===== detect architecture =====
 ARCH=$(uname -m)
-echo "🖥️  Detected architecture: $ARCH"
+OS=$(uname -s)
+echo "🖥️  Detected architecture: $ARCH  OS: $OS"
 
 # ===== choose optimization flags =====
 if [[ "$ARCH" == "x86_64" ]]; then
@@ -21,14 +22,29 @@ if [[ "$ARCH" == "x86_64" ]]; then
     OPT_FLAGS="-O3 -DNDEBUG -march=native -flto"
 
 elif [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then
-    echo "⚙️  Target: ARM (aarch64)"
 
-    # 👉 你是 KV260（Cortex-A72）
-    OPT_FLAGS="-O3 -DNDEBUG -mcpu=cortex-a72 -ffast-math"
+    if [[ "$OS" == "Darwin" ]]; then
+        echo "⚙️  Target: Apple Silicon (arm64)"
+        OPT_FLAGS="-O3 -DNDEBUG -mcpu=apple-m1 -ffast-math"
+
+        # Homebrew 在 Apple Silicon 裝在 /opt/homebrew
+        HOMEBREW_PREFIX="/opt/homebrew"
+        export PKG_CONFIG_PATH="$HOMEBREW_PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
+        INCLUDE_FLAGS="-I. -I$HOMEBREW_PREFIX/include"
+        EXTRA_LDFLAGS="-L$HOMEBREW_PREFIX/lib"
+    else
+        echo "⚙️  Target: ARM (aarch64)"
+        # 👉 你是 KV260（Cortex-A72）
+        OPT_FLAGS="-O3 -DNDEBUG -mcpu=cortex-a72 -ffast-math"
+        INCLUDE_FLAGS="-I."
+        EXTRA_LDFLAGS=""
+    fi
 
 else
     echo "⚠️  Unknown architecture, fallback generic"
     OPT_FLAGS="-O3 -DNDEBUG"
+    INCLUDE_FLAGS="-I."
+    EXTRA_LDFLAGS=""
 fi
 
 # ===== OpenCV flags =====
@@ -36,7 +52,6 @@ CXXFLAGS="$(pkg-config --cflags opencv4)"
 LIBS="$(pkg-config --libs opencv4)"
 
 # ===== include paths =====
-INCLUDE_FLAGS="-I."
 if [ -n "$EXTRA_PATH" ]; then
     INCLUDE_FLAGS="$INCLUDE_FLAGS -I$EXTRA_PATH"
 fi
@@ -60,6 +75,7 @@ echo "⚡ Optimization: $OPT_FLAGS"
     $CXXFLAGS \
     $SRC_FILES \
     $LIBS \
+    $EXTRA_LDFLAGS \
     -o "$OUT_FILE"
 
 echo "✅ Build success: $OUT_FILE"

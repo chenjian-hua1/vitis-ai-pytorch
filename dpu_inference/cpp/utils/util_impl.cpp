@@ -217,16 +217,16 @@ ResizeResult resize_zero_copy(const cv::Mat& img, int input_size)
     float dw = (input_size - new_w) / 2.0f;
     float dh = (input_size - new_h) / 2.0f;
 
-    int top    = static_cast<int>(std::round(dh - 0.1f));
-    int bottom = static_cast<int>(std::round(dh + 0.1f));
-    int left   = static_cast<int>(std::round(dw - 0.1f));
-    int right  = static_cast<int>(std::round(dw + 0.1f));
+    int top  = static_cast<int>(std::round(dh - 0.1f));
+    int left = static_cast<int>(std::round(dw - 0.1f));
 
     // 🔥 只分配一次輸出
     cv::Mat out(input_size, input_size, img.type(), cv::Scalar(0,0,0));
 
-    // 🔥 ROI（關鍵）
-    cv::Rect roi(left, top, new_w, new_h);
+    // 🔥 ROI：以 top/left 為準，寬高用實際剩餘空間 clamp，避免越界
+    int roi_w = std::min(new_w, input_size - left);
+    int roi_h = std::min(new_h, input_size - top);
+    cv::Rect roi(left, top, roi_w, roi_h);
     cv::Mat dst_roi = out(roi);
 
     // 🔥 直接 resize 到 ROI（沒有 resized 中間變數）
@@ -428,9 +428,14 @@ cv::Mat YOLOPostProcessor::operator()(const std::vector<cv::Mat>& x,
         int hw = xi.size[2] * xi.size[3];
         for (int b = 0; b < B; ++b) {
             for (int c = 0; c < no_; ++c) {
-                for (int a = 0; a < hw; ++a) {
-                    x_cat.at<float>(std::vector<int>{b, c, col_offset + a}.data())
-                        = xi.at<float>(std::vector<int>{b, c, a}.data());
+                int h_dim = xi.size[2];
+                int w_dim = xi.size[3];
+                for (int gy = 0; gy < h_dim; ++gy) {
+                    for (int gx = 0; gx < w_dim; ++gx) {
+                        int a = gy * w_dim + gx;
+                        x_cat.at<float>(std::vector<int>{b, c, col_offset + a}.data())
+                            = xi.at<float>(std::vector<int>{b, c, gy, gx}.data());
+                    }
                 }
             }
         }

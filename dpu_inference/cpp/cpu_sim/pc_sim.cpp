@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
     std::vector<std::vector<Detection>> nms_result;
 
     for (int i = 0; i < WARMUP; ++i) {
-        resize_result = resize(img, 640);
+        resize_result = resize_zero_copy(img, 640);
         norm_img = norm(resize_result.img);
         fix_img = float2fix(norm_img, 4);
         float_img = fix2float(fix_img, 4);
@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
 
     for (int i = 0; i < ITER; ++i) {
         double t0 = time_now();
-        resize_result = resize(img, 640);
+        resize_result = resize_zero_copy(img, 640);
         t_resize += time_now() - t0;
 
         t0 = time_now();
