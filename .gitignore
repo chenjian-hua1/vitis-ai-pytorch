@@ -1,33 +1,16 @@
+**/.*
+**/__pycache__
+**/.vscode
+**/.vai
+train/**/*.pt
 test file/model/resnet18_best.pth
 test file/model/resnet18_pruned.pth
 train/quantize_result/*
 train/runs/*
-train/yolo26n.pt
 train/track_out.mp4
-.vscode/settings.json
-train/arch/__pycache__/yolo11.cpython-39.pyc
-train/utils/__pycache__/util.cpython-39.pyc
 install_sript/condaenv.lp_zbqz9.requirements.txt
-train/yolo11n.pt
-test file/kv26_dpu/kv26_resnet18.xmodel
-test file/.vai/ResNet_ratio_0.1_pruning_info.json
-test file/.vai/ResNet_ratio_0.1.spec
-test file/.vai/ResNet.sens
-test file/kv26_dpu/md5sum.txt
 test file/resnet18_best.pth
 test file/resnet18_pruned.pth
-test file/kv26_dpu/meta.json
-train/utils/__pycache__/dataset.cpython-39.pyc
-train/ex.py
-train/arch/__pycache__/yolo11.cpython-38.pyc
-train/utils/__pycache__/util.cpython-38.pyc
+test file/kv26_dpu/*
 train/weights/*
-train/yolo_library.ipynb
-train/arch/__pycache__/yolo11_source.cpython-39.pyc
 test file/quantize_result/*
-train/weights/*
-train/utils/__pycache__/dataset.cpython-38.pyc
-train/__pycache__/yolo_train.cpython-38.pyc
-train/yolo_kv26/*
-**/__pycache__
-**/.*
