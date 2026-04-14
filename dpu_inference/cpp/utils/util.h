@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <tuple>
+
 #include <opencv2/opencv.hpp>
 
 // ============================================================================
@@ -139,6 +140,7 @@ cv::Mat norm(const cv::Mat& x);
  * @return           ResizeResult containing image, ratio, and padding
  */
 ResizeResult resize(const cv::Mat& img, int input_size);
+ResizeResult resize_zero_copy(const cv::Mat& img, int input_size);
 
 // ============================================================================
 //  Post-Processing

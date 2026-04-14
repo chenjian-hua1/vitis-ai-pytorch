@@ -202,6 +202,49 @@ ResizeResult resize(const cv::Mat& img, int input_size)
     return res;
 }
 
+ResizeResult resize_zero_copy(const cv::Mat& img, int input_size)
+{
+    int orig_h = img.rows;
+    int orig_w = img.cols;
+
+    float r = std::min((float)input_size / orig_h,
+                       (float)input_size / orig_w);
+    r = std::min(r, 1.0f);
+
+    int new_w = static_cast<int>(std::round(orig_w * r));
+    int new_h = static_cast<int>(std::round(orig_h * r));
+
+    float dw = (input_size - new_w) / 2.0f;
+    float dh = (input_size - new_h) / 2.0f;
+
+    int top    = static_cast<int>(std::round(dh - 0.1f));
+    int bottom = static_cast<int>(std::round(dh + 0.1f));
+    int left   = static_cast<int>(std::round(dw - 0.1f));
+    int right  = static_cast<int>(std::round(dw + 0.1f));
+
+    // 🔥 只分配一次輸出
+    cv::Mat out(input_size, input_size, img.type(), cv::Scalar(0,0,0));
+
+    // 🔥 ROI（關鍵）
+    cv::Rect roi(left, top, new_w, new_h);
+    cv::Mat dst_roi = out(roi);
+
+    // 🔥 直接 resize 到 ROI（沒有 resized 中間變數）
+    if (new_w != orig_w || new_h != orig_h) {
+        cv::resize(img, dst_roi, dst_roi.size(), 0, 0, cv::INTER_LINEAR);
+    } else {
+        // ⚠️ 這裡仍然會 copy（無法完全避免，因為位置不同）
+        img.copyTo(dst_roi);
+    }
+
+    ResizeResult res;
+    res.img   = out;
+    res.ratio = {r, r};
+    res.pad   = {dw, dh};
+
+    return res;
+}
+
 // ============================================================================
 //  Post-Processing — DFL
 // ============================================================================
