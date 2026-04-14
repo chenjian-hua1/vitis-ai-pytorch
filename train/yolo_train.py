@@ -20,6 +20,7 @@ import argparse
 
 import torch
 import torch.nn.functional as F
+import numpy as np
 import tqdm
 
 from arch.yolo11 import yolo_v11_n, YOLOPostProcessor
@@ -275,7 +276,8 @@ def train(args, params, dataset_config):
                 step = i + num_steps * epoch
                 scheduler.step(step, optimizer)
 
-                samples = samples.cuda().float() / 255.0
+                # samples = samples.cuda().float() / 255.0
+                samples = util.norm(samples.cuda())
 
                 # ── [NEW] 多尺度訓練 ───────────────────────
                 # if multi_scale and epoch < EPOCHS - 30:
@@ -313,7 +315,7 @@ def train(args, params, dataset_config):
                 p_bar.set_description(s)
 
             # ── Validation ─────────────────────────────────
-            last = test(args, dataset_config, model=ema.ema)
+            last = test(args, dataset_config, params, model=ema.ema)
 
             logger.writerow({
                 "epoch":     str(epoch + 1).zfill(3),
@@ -393,7 +395,8 @@ def test(args, dataset_config, params, model=None):
                       desc=("%10s" * 5) % ("", "precision", "recall", "mAP50", "mAP"))
 
     for samples, targets in p_bar:
-        samples = samples.cuda().half() / 255.0
+        # samples = samples.cuda().half() / 255.0
+        samples = util.norm(samples.cuda().half() / 255.0)
         _, _, h, w = samples.shape
         scale = torch.tensor((w, h, w, h)).cuda()
 

@@ -1,8 +1,0 @@
-{
-    "lib": "libvart-dpu-runner.so",
-    "filename": "yolo_kv26.xmodel",
-    "kernel": [
-        "subgraph_YOLO__YOLO_DarkFPN_fpn__CSP_h1__Conv_conv1__Conv2d_conv__ret_269"
-    ],
-    "target": "DPUCZDX8G_ISA1_B4096"
-}

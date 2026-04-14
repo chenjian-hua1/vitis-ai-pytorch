@@ -174,6 +174,7 @@ for p in args.extra_path:
 # ─────────────────────────────────────────────
 try:
     from utils.dataset import create_dataloader
+    from utils.util import norm
 except ImportError as e:
     raise ImportError(
         "Cannot import create_dataloader from utils.dataset. "
@@ -288,7 +289,8 @@ def forward_loop(model, val_loader):
     model = model.to(device)
     with torch.no_grad():
         for samples, _ in tqdm(val_loader, desc="Calibrating"):
-            samples = samples.to(device).float() / 255.0
+            samples = norm(samples.to(device).float())
+            samples = samples.to(device).float() / 255.
             model(samples)
 
 

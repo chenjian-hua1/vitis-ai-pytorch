@@ -357,7 +357,28 @@ class DFL(torch.nn.Module):
 
 
 class YOLOPostProcessor(torch.nn.Module):
+    """
+    [call function] Decode raw YOLO multi-scale feature maps into box + class predictions.
+
+    x           : list of feature maps, each (B, no, H, W)  float32
+    conf_thresh : confidence threshold (unused here, applied in NMS)
+
+    Returns
+    -------
+    output : (B, 4+nc, Anchors)
+                axis-1 layout: [cx, cy, w, h, cls_score_0, ..., cls_score_{nc-1}]
+    """
     def __init__(self, nc=80, ch=16, strides=[8, 16, 32]):
+        """
+        Args:
+            nc      (int)       : Number of classes (e.g. 80 for COCO, 4 for custom). Default: 80
+            ch      (int)       : Number of DFL bins per coordinate. Default: 16
+            strides (List[int]) : Downsampling strides for each detection scale.
+                                8  -> large feature map  (80×80 for 640 input)
+                                16 -> medium feature map (40×40 for 640 input)
+                                32 -> small feature map  (20×20 for 640 input)
+                                Default: [8, 16, 32]
+        """
         super().__init__()
         self.nc = nc
         self.ch = ch
@@ -367,7 +388,15 @@ class YOLOPostProcessor(torch.nn.Module):
 
     def forward(self, x):
         """
-        接收模型輸出的三層特徵圖 (List of Tensors)，解碼出真實的 Box 和 Cls
+        Decode raw YOLO multi-scale feature maps into box + class predictions.
+
+        x           : list of feature maps, each (B, no, H, W)  float32
+        conf_thresh : confidence threshold (unused here, applied in NMS)
+
+        Returns
+        -------
+        output : (B, 4+nc, Anchors)
+                 axis-1 layout: [cx, cy, w, h, cls_score_0, ..., cls_score_{nc-1}]
         """
 
         # ── 修正：明確指定 dtype=float32，避免 int64 ──────────
