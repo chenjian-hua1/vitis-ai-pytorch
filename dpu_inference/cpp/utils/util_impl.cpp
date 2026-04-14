@@ -42,19 +42,32 @@ constexpr float kF32ScaleB = 1.f/kStdB;
 cv::Mat fix2float(const cv::Mat& data, int fix_point)
 {
     cv::Mat out;
-    data.convertTo(out, CV_32F);               // cast int8 → float32
-    out *= std::exp2(-static_cast<float>(fix_point));
+    data.convertTo(out, CV_32F);  // int8 → float
+
+    float scale = 1.0f / static_cast<float>(1 << fix_point); // 2^-fix_point
+    out *= scale;
+
     return out;
 }
 
 cv::Mat float2fix(const cv::Mat& data, int fix_point)
 {
+    // 改用 .depth() 檢查，這只會檢查資料型別(Float32)，不論通道數
+    CV_Assert(data.depth() == CV_32F);
+
+    float scale = static_cast<float>(1 << fix_point);
+
     cv::Mat out;
-    data.convertTo(out, CV_32F);               // ensure float32
-    out *= static_cast<float>(1 << fix_point); // multiply by 2^fix_point
-    out = cv::max(out, -128.f);
-    out = cv::min(out,  127.f);
-    out.convertTo(out, CV_8S);
+    data.convertTo(out, CV_8S, scale);  // float → int8 (Q format)
+
+    // float scale = static_cast<float>(1 << fix_point); // 2^fix_point (bit shift)
+    // out *= scale;
+
+    // out = cv::max(out, -128.f);
+    // out = cv::min(out,  127.f);
+
+    // out.convertTo(out, CV_8S);
+
     return out;
 }
 
@@ -515,20 +528,44 @@ cv::Mat scale_boxes(const cv::Mat&        boxes,
                     std::pair<float,float> pad,
                     cv::Size               orig_shape)
 {
-    // orig_shape: cv::Size(width, height)
-    cv::Mat out = boxes.clone();
-    out.convertTo(out, CV_32F);
+    cv::Mat out;
+    boxes.convertTo(out, CV_32F);
 
-    for (int i = 0; i < out.rows; ++i) {
-        out.at<float>(i,0) = std::clamp((out.at<float>(i,0) - pad.first)  / ratio.first,
-                                         0.f, static_cast<float>(orig_shape.width));
-        out.at<float>(i,1) = std::clamp((out.at<float>(i,1) - pad.second) / ratio.second,
-                                         0.f, static_cast<float>(orig_shape.height));
-        out.at<float>(i,2) = std::clamp((out.at<float>(i,2) - pad.first)  / ratio.first,
-                                         0.f, static_cast<float>(orig_shape.width));
-        out.at<float>(i,3) = std::clamp((out.at<float>(i,3) - pad.second) / ratio.second,
-                                         0.f, static_cast<float>(orig_shape.height));
+    float w_max = static_cast<float>(orig_shape.width);
+    float h_max = static_cast<float>(orig_shape.height);
+
+    // x1
+    {
+        cv::Mat col = (out.col(0) - pad.first) / ratio.first;
+        cv::min(col, w_max, col);
+        cv::max(col, 0.f, col);
+        col.copyTo(out.col(0));
     }
+
+    // y1
+    {
+        cv::Mat col = (out.col(1) - pad.second) / ratio.second;
+        cv::min(col, h_max, col);
+        cv::max(col, 0.f, col);
+        col.copyTo(out.col(1));
+    }
+
+    // x2
+    {
+        cv::Mat col = (out.col(2) - pad.first) / ratio.first;
+        cv::min(col, w_max, col);
+        cv::max(col, 0.f, col);
+        col.copyTo(out.col(2));
+    }
+
+    // y2
+    {
+        cv::Mat col = (out.col(3) - pad.second) / ratio.second;
+        cv::min(col, h_max, col);
+        cv::max(col, 0.f, col);
+        col.copyTo(out.col(3));
+    }
+
     return out;
 }
 
