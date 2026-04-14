@@ -41,11 +41,15 @@ constexpr float kF32ScaleB = 1.f/kStdB;
 
 cv::Mat fix2float(const cv::Mat& data, int fix_point)
 {
-    cv::Mat out;
-    data.convertTo(out, CV_32F);  // int8 → float
+    // 確保輸入是 8-bit 有號整數 (INT8)，這是 DPU 常見的輸出型別
+    CV_Assert(data.depth() == CV_8S);
 
-    float scale = 1.0f / static_cast<float>(1 << fix_point); // 2^-fix_point
-    out *= scale;
+    cv::Mat out;
+    // 使用 double 計算 scale 以維持精度，避免 1 << fix_point 在大位數時溢位
+    double scale = 1.0 / static_cast<double>(1 << fix_point);
+
+    // 直接完成：[int8] -> [乘上 scale] -> [轉成 float32]
+    data.convertTo(out, CV_32F, scale);
 
     return out;
 }
