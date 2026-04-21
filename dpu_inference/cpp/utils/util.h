@@ -45,18 +45,19 @@ struct Detection {
  *
  * @param data      CV_8S Mat of fixed-point values
  * @param fix_point Exponent (scale = 2^(-fix_point))
- * @return          CV_32F Mat
+ * @param out       CV_32F Mat reused across calls to avoid repeated allocation.
  */
-cv::Mat fix2float(const cv::Mat& data, int fix_point);
+void fix2float(const cv::Mat& data, int fix_point, cv::Mat& out);
 
 /**
  * @brief Convert float32 array to int8 fixed-point.
  *
  * @param data      CV_32F Mat
  * @param fix_point Exponent (scale = 2^fix_point)
- * @return          CV_8S Mat clipped to [-128, 127]
+ * @param out       CV_8S Mat clipped to [-128, 127],
+ *                  reused across calls to avoid repeated allocation.
  */
-cv::Mat float2fix(const cv::Mat& data, int fix_point);
+void float2fix(const cv::Mat& data, int fix_point, cv::Mat& out);
 
 // ============================================================================
 //  Bounding Box Utilities
@@ -100,35 +101,32 @@ AnchorResult make_anchors(const std::vector<cv::Mat>& feature_maps,
 // ============================================================================
 
 /**
-/**
  * @brief Normalize an image using ImageNet mean/std statistics.
  *
  * Performs per-channel linear transformation:
- *   out[c] = (x[c] / (std[c] * 255)) - (mean[c] / std[c])   (uint8 input)
- *   out[c] =  x[c] / std[c]          - (mean[c] / std[c])   (float32 input)
+ *   out[c] = (x[c] / (std[c] * 255)) - (mean[c] / std[c])
  *
  * ImageNet constants:
  *   mean = [0.485, 0.456, 0.406]  (R, G, B)
  *   std  = [0.229, 0.224, 0.225]  (R, G, B)
  *
- * @param x Input image with the following constraints:
- *            - Shape  : (H, W, 3), must be continuous in memory
- *            - Depth  : CV_8U  [0, 255]  or CV_32F [0.0, 1.0]
- *            - Channel: 3 (BGR or RGB, channel order must match
- *                          the order used during model training)
+ * @param x   Input image with the following constraints:
+ *              - Shape  : (H, W, 3), must be continuous in memory
+ *              - Depth  : CV_8U [0, 255]
+ *              - Channel: 3 (BGR or RGB, channel order must match
+ *                            the order used during model training)
+ * @param out Output image reused across calls to avoid repeated allocation.
+ *              - Depth  : CV_32F
+ *              - Shape  : same as input (H, W, 3)
+ *              - Range  : approximately [-2.5, 2.5] per channel
  *
- * @return cv::Mat with:
- *            - Depth  : CV_32F
- *            - Shape  : same as input (H, W, 3)
- *            - Range  : approximately [-2.5, 2.5] per channel
- *
- * @throws cv::Exception if x is not 3-channel or not continuous
+ * @throws cv::Exception if x is not CV_8U, not 3-channel, or not continuous
  *
  * @note Channel order (BGR vs RGB) is NOT checked internally.
  *       Caller is responsible for ensuring correct channel ordering
  *       before passing to this function.
  */
-cv::Mat norm(const cv::Mat& x);
+void norm(const cv::Mat& x, cv::Mat& out);
 
 /**
  * @brief Letterbox-resize an image to a square of side `input_size`.
@@ -137,10 +135,10 @@ cv::Mat norm(const cv::Mat& x);
  *
  * @param img        Input BGR image
  * @param input_size Target side length (e.g. 640)
- * @return           ResizeResult containing image, ratio, and padding
+ * @param res        ResizeResult reused across calls to avoid repeated allocation,
+ *                   containing output image, ratio, and padding.
  */
-ResizeResult resize(const cv::Mat& img, int input_size);
-ResizeResult resize_zero_copy(const cv::Mat& img, int input_size);
+void resize(const cv::Mat& img, int input_size, ResizeResult& res);
 
 // ============================================================================
 //  Post-Processing

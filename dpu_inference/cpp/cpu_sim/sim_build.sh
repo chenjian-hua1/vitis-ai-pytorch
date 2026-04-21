@@ -49,7 +49,8 @@ fi
 
 # ===== OpenCV flags =====
 CXXFLAGS="$(pkg-config --cflags opencv4)"
-LIBS="$(pkg-config --libs opencv4)"
+# LIBS="$(pkg-config --libs opencv4)"
+LIBS="$(pkg-config --libs opencv4) -lonnxruntime"
 
 # ===== include paths =====
 if [ -n "$EXTRA_PATH" ]; then

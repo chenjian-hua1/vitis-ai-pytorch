@@ -79,17 +79,6 @@ class CSP(torch.nn.Module):
         else:
             self.res_m = torch.nn.ModuleList(CSPModule(out_ch // r, out_ch // r) for _ in range(n))
 
-    # def forward(self, x):
-    #     # 原始寫法：
-    #     # y = list(self.conv1(x).chunk(2, 1))
-    #     # 修改為切片寫法：
-    #     out = self.conv1(x)
-    #     c = out.shape[1] // 2
-    #     y = [out[:, :c, :, :], out[:, c:, :, :]]
-
-    #     y.extend(m(y[-1]) for m in self.res_m)
-    #     return self.conv2(torch.cat(y, dim=1))
-
     def forward(self, x):
         # 1. 經過第一層卷積
         out = self.conv1(x)
@@ -126,48 +115,6 @@ class SPP(torch.nn.Module):
         # 🛑 關鍵：先把 y3 算出來！
         y3 = self.res_m(y2)
         return self.conv2(torch.cat(tensors=(x, y1, y2, y3), dim=1))
-
-class ConvAttention(torch.nn.Module):
-    """
-    用純卷積 (Conv) 與池化 (Pool) 構建的 Attention 機制。
-    保證 100% 通過 Vitis AI XIR 編譯器，且運算極度硬體友善。
-    """
-    def __init__(self, ch, num_head=None): # 保留 num_head 參數以相容你原本的呼叫
-        super().__init__()
-        
-        # 1. 通道注意力 (Channel Attention)：用 1x1 卷積取代 Linear/Matmul
-        self.avg_pool = torch.nn.AdaptiveAvgPool2d(1)
-        self.conv_c1 = torch.nn.Conv2d(ch, ch // 2, kernel_size=1, bias=False)
-        self.ReLU = torch.nn.ReLU()
-        self.conv_c2 = torch.nn.Conv2d(ch // 2, ch, kernel_size=1, bias=False)
-        
-        # 2. 空間特徵融合 (Spatial Mixing)：用大核的 Depthwise 卷積取代全局 QxK 運算
-        # kernel_size=5, padding=2 可以捕捉更大的感受野，達到類似 Attention 的效果
-        self.dwconv = torch.nn.Conv2d(ch, ch, kernel_size=5, padding=2, groups=ch, bias=False)
-        
-        # 3. 輸出映射
-        self.conv_out = torch.nn.Conv2d(ch, ch, kernel_size=1, bias=False)
-
-    def forward(self, x):
-        # --- 通道注意力分支 ---
-        # 透過 Global Average Pooling 取得全局資訊，再用 1x1 卷積算出通道權重
-        y = self.avg_pool(x)
-        y = self.conv_c1(y)
-        y = self.ReLU(y)
-        y = self.conv_c2(y)
-        
-        # 用 Sigmoid 將權重限縮在 0~1 之間 (這是 DPU 支援的操作)
-        attn_weights = y.sigmoid()
-        
-        # 將權重乘回原特徵圖 (Element-wise Multiplication，DPU 完全支援)
-        out = x * attn_weights
-        
-        # --- 空間特徵分支 ---
-        # 透過 Depthwise 卷積進行相鄰像素的特徵融合，彌補失去 QK 矩陣相乘的空間感知力
-        out = self.dwconv(out)
-        
-        # 最後整理通道輸出
-        return self.conv_out(out)
 
 class Attention(torch.nn.Module):
 
@@ -298,20 +245,6 @@ class DarkFPN(torch.nn.Module):
         self.h4 = CSP(width[3] + width[4], width[4], depth[5], csp[0], r=2)
         self.h5 = Conv(width[4], width[4], torch.nn.ReLU(), k=3, s=2, p=1)
         self.h6 = CSP(width[4] + width[5], width[5], depth[5], csp[1], r=2)
-
-    # def forward(self, p3, p4, p5):
-    #     # p3, p4, p5 = x
-    #     # p4 = self.h1(torch.cat(tensors=[self.up(p5), p4], dim=1))
-    #     # p3 = self.h2(torch.cat(tensors=[self.up(p4), p3], dim=1))
-    #     # p4 = self.h4(torch.cat(tensors=[self.h3(p3), p4], dim=1))
-    #     # p5 = self.h6(torch.cat(tensors=[self.h5(p4), p5], dim=1))
-
-    #     p4 = self.h1(torch.cat(tensors=(self.up(p5), p4), dim=1))
-    #     p3 = self.h2(torch.cat(tensors=(self.up(p4), p3), dim=1))
-    #     p4 = self.h4(torch.cat(tensors=(self.h3(p3), p4), dim=1))
-    #     p5 = self.h6(torch.cat(tensors=(self.h5(p4), p5), dim=1))
-
-    #     return p3, p4, p5
     
     def forward(self, p3, p4, p5):
         # 🛑 關鍵：把每一個運算都獨立成一行，清清楚楚，不要有任何巢狀函數
@@ -347,12 +280,8 @@ class DFL(torch.nn.Module):
 
     def forward(self, x):
         b, c, a = x.shape
-        # 1. 避免使用 x.shape 解包
-        # b = x.size(0)
-        # a = x.size(2)
-        # b = int(x.shape[0])
-        # a = int(x.shape[2])
         x = x.view(b, 4, self.ch, a).transpose(2, 1)
+
         return self.conv(x.softmax(1)).view(b, 4, a)
 
 
@@ -450,23 +379,6 @@ class Head(torch.nn.Module):
                                                            Conv(cls, cls, torch.nn.ReLU()),
                                                            torch.nn.Conv2d(cls, out_channels=self.nc,
                                                                            kernel_size=1)) for x in filters)
-
-    # def forward(self, x):
-    #     for i, (box, cls) in enumerate(zip(self.box, self.cls)):
-    #         x[i] = torch.cat(tensors=(box(x[i]), cls(x[i])), dim=1)
-    #     if self.training:
-    #         return x
-
-    #     self.anchors, self.strides = (i.transpose(0, 1) for i in make_anchors(x, self.stride))
-    #     x = torch.cat([i.view(x[0].shape[0], self.no, -1) for i in x], dim=2)
-    #     box, cls = x.split(split_size=(4 * self.ch, self.nc), dim=1)
-
-    #     a, b = self.dfl(box).chunk(2, 1)
-    #     a = self.anchors.unsqueeze(0) - a
-    #     b = self.anchors.unsqueeze(0) + b
-    #     box = torch.cat(tensors=((a + b) / 2, b - a), dim=1)
-
-    #     return torch.cat(tensors=(box * self.strides, cls.sigmoid()), dim=1)
     
     # 🛑 關鍵：參數改為接收 p3, p4, p5，而不是單一的 x
     def forward(self, p3, p4, p5):
@@ -508,12 +420,6 @@ class YOLO(torch.nn.Module):
         self.head.stride = torch.tensor([256 / x.shape[-2] for x in self.forward(img_dummy)])
         self.stride = self.head.stride
         self.head.initialize_biases()
-
-    # def forward(self, x):
-    #     x = self.net(x)
-    #     x = self.fpn(x)
-    #     # return self.head(list(x))
-    #     return self.head(x)
 
     def forward(self, x):
         p3, p4, p5 = self.net(x)  # 從 Backbone 取得 3 個獨立的 Tensor

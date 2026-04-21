@@ -39,40 +39,31 @@ constexpr float kF32ScaleB = 1.f/kStdB;
 //  Fix / Float Conversion
 // ============================================================================
 
-cv::Mat fix2float(const cv::Mat& data, int fix_point)
+void fix2float(const cv::Mat& data, int fix_point, cv::Mat& out)
 {
     // 確保輸入是 8-bit 有號整數 (INT8)，這是 DPU 常見的輸出型別
     CV_Assert(data.depth() == CV_8S);
 
-    cv::Mat out;
     // 使用 double 計算 scale 以維持精度，避免 1 << fix_point 在大位數時溢位
     double scale = 1.0 / static_cast<double>(1 << fix_point);
 
     // 直接完成：[int8] -> [乘上 scale] -> [轉成 float32]
+    // out is passed by reference from the caller to avoid repeated allocation.
+    // convertTo reuses the existing buffer as long as size and type remain unchanged.
     data.convertTo(out, CV_32F, scale);
-
-    return out;
 }
 
-cv::Mat float2fix(const cv::Mat& data, int fix_point)
+void float2fix(const cv::Mat& data, int fix_point, cv::Mat& out)
 {
     // 改用 .depth() 檢查，這只會檢查資料型別(Float32)，不論通道數
     CV_Assert(data.depth() == CV_32F);
 
-    float scale = static_cast<float>(1 << fix_point);
+    double scale = static_cast<double>(1 << fix_point);
 
-    cv::Mat out;
-    data.convertTo(out, CV_8S, scale);  // float → int8 (Q format)
-
-    // float scale = static_cast<float>(1 << fix_point); // 2^fix_point (bit shift)
-    // out *= scale;
-
-    // out = cv::max(out, -128.f);
-    // out = cv::min(out,  127.f);
-
-    // out.convertTo(out, CV_8S);
-
-    return out;
+    // float → int8 (Q format)
+    // out is passed by reference from the caller to avoid repeated allocation.
+    // convertTo reuses the existing buffer as long as size and type remain unchanged.
+    data.convertTo(out, CV_8S, scale);
 }
 
 // ============================================================================
@@ -154,112 +145,55 @@ AnchorResult make_anchors(const std::vector<cv::Mat>& feature_maps,
 //  Pre-Processing
 // ============================================================================
 
-cv::Mat norm(const cv::Mat& x)
+void norm(const cv::Mat& x, cv::Mat& out)
 {
-    // Select per-channel scale based on input depth:
-    //   uint8  path: scale = 1 / (std * 255)
-    //   float32 path: scale = 1 / std
-    // bias = -(mean / std) is identical for both paths (precomputed at compile time)
-    const bool is_uint8 = (x.depth() == CV_8U);
-    const float scaleR = is_uint8 ? kU8ScaleR : kF32ScaleR;
-    const float scaleG = is_uint8 ? kU8ScaleG : kF32ScaleG;
-    const float scaleB = is_uint8 ? kU8ScaleB : kF32ScaleB;
+    CV_Assert(x.type() == CV_8UC3);
 
-    std::vector<cv::Mat> ch(3);
-    cv::split(x, ch);
+    out.create(x.rows, x.cols, CV_32FC3);
 
-    // convertTo(dst, type, alpha, beta) computes: dst = src * alpha + beta
-    // which maps directly to a single FMA instruction (fused multiply-add).
-    // Both alpha (scale) and beta (bias) are compile-time constants,
-    // so no runtime arithmetic is performed outside the FMA itself.
-    //   ch[c] = fma(src[c], scale[c], bias[c])
-    //         = src[c] * scale[c] + bias[c]
-    ch[0].convertTo(ch[0], CV_32F, scaleR, kU8BiasR);
-    ch[1].convertTo(ch[1], CV_32F, scaleG, kU8BiasG);
-    ch[2].convertTo(ch[2], CV_32F, scaleB, kU8BiasB);
+    const uchar* src = x.ptr<uchar>();
+    float* dst = out.ptr<float>();
 
-    cv::Mat out;
-    cv::merge(ch, out);
-    return out;
+    int total = x.rows * x.cols;
+
+    // Parellel Optimize dataflow & Memory Access
+    for (int i = 0; i < total; i++) {
+        dst[3*i + 0] = src[3*i + 0] * kU8ScaleR + kU8BiasR;
+        dst[3*i + 1] = src[3*i + 1] * kU8ScaleG + kU8BiasG;
+        dst[3*i + 2] = src[3*i + 2] * kU8ScaleB + kU8BiasB;
+    }
 }
 
-ResizeResult resize(const cv::Mat& img, int input_size)
+void resize(const cv::Mat& img, int input_size, ResizeResult& res)
 {
-    int orig_h = img.rows, orig_w = img.cols;
+    const int orig_h = img.rows, orig_w = img.cols;
+
     float r = std::min(static_cast<float>(input_size) / orig_h,
-                       static_cast<float>(input_size) / orig_w);
-    r = std::min(r, 1.0f);  // never upscale
+                    static_cast<float>(input_size) / orig_w);
+    r = std::min(r, 1.0f);
 
     int pad_w = static_cast<int>(std::round(orig_w * r));
     int pad_h = static_cast<int>(std::round(orig_h * r));
 
-    float dw = (input_size - pad_w) / 2.0f;
-    float dh = (input_size - pad_h) / 2.0f;
-
-    cv::Mat resized;
-    if (img.cols != pad_w || img.rows != pad_h) {
-        cv::resize(img, resized, cv::Size(pad_w, pad_h), 0, 0, cv::INTER_LINEAR);
-    } else {
-        resized = img.clone();
-    }
+    int dw = (input_size - pad_w) / 2.0f;
+    int dh = (input_size - pad_h) / 2.0f;
 
     int top    = static_cast<int>(std::round(dh - 0.1f));
     int bottom = static_cast<int>(std::round(dh + 0.1f));
     int left   = static_cast<int>(std::round(dw - 0.1f));
     int right  = static_cast<int>(std::round(dw + 0.1f));
 
-    cv::Mat out;
-    cv::copyMakeBorder(resized, out, top, bottom, left, right,
-                       cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
-
-    ResizeResult res;
-    res.img   = out;
-    res.ratio = {r, r};
-    res.pad   = {dw, dh};
-    return res;
-}
-
-ResizeResult resize_zero_copy(const cv::Mat& img, int input_size)
-{
-    int orig_h = img.rows;
-    int orig_w = img.cols;
-
-    float r = std::min((float)input_size / orig_h,
-                       (float)input_size / orig_w);
-    r = std::min(r, 1.0f);
-
-    int new_w = static_cast<int>(std::round(orig_w * r));
-    int new_h = static_cast<int>(std::round(orig_h * r));
-
-    float dw = (input_size - new_w) / 2.0f;
-    float dh = (input_size - new_h) / 2.0f;
-
-    int top  = static_cast<int>(std::round(dh - 0.1f));
-    int left = static_cast<int>(std::round(dw - 0.1f));
-
-    // 🔥 只分配一次輸出
-    cv::Mat out(input_size, input_size, img.type(), cv::Scalar(0,0,0));
-
-    // 🔥 ROI：以 top/left 為準，寬高用實際剩餘空間 clamp，避免越界
-    int roi_w = std::min(new_w, input_size - left);
-    int roi_h = std::min(new_h, input_size - top);
-    cv::Rect roi(left, top, roi_w, roi_h);
-    cv::Mat dst_roi = out(roi);
-
-    // 🔥 直接 resize 到 ROI（沒有 resized 中間變數）
-    if (new_w != orig_w || new_h != orig_h) {
-        cv::resize(img, dst_roi, dst_roi.size(), 0, 0, cv::INTER_LINEAR);
-    } else {
-        // ⚠️ 這裡仍然會 copy（無法完全避免，因為位置不同）
-        img.copyTo(dst_roi);
-    }
-
-    ResizeResult res;
-    res.img   = out;
-    res.ratio = {r, r};
+    res.ratio = {r,  r};
     res.pad   = {dw, dh};
 
-    return res;
+    // 🔥 一次配置
+    res.img.create(input_size, input_size, img.type());
+    res.img.setTo(cv::Scalar(0,0,0));  // padding
+
+    // 🔥 ROI 直接寫入
+    cv::Mat roi = res.img(cv::Rect(left, top, pad_w, pad_h));
+
+    cv::resize(img, roi, roi.size(), 0, 0, cv::INTER_LINEAR);
 }
 
 // ============================================================================
