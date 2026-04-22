@@ -80,23 +80,6 @@ cv::Mat wh2xy(const cv::Mat& x);
 cv::Mat xyxy2xywh(const cv::Mat& box);
 
 // ============================================================================
-//  Anchor Generation
-// ============================================================================
-
-/**
- * @brief Generate anchor points for each feature-map scale.
- *
- * @param feature_maps List of feature maps, each CV_32F (B, C, H, W) stored
- *                     as a 4-dim Mat or equivalent shape vector {B,C,H,W}.
- * @param strides      Downsampling factors, e.g. {8, 16, 32}
- * @param offset       Anchor offset from grid origin (default 0.5)
- * @return             AnchorResult with anchors (A,2) and stride_tensor (A,1)
- */
-AnchorResult make_anchors(const std::vector<cv::Mat>& feature_maps,
-                           const std::vector<int>&     strides,
-                           float                       offset = 0.5f);
-
-// ============================================================================
 //  Pre-Processing
 // ============================================================================
 
@@ -141,69 +124,147 @@ void norm(const cv::Mat& x, cv::Mat& out);
 void resize(const cv::Mat& img, int input_size, ResizeResult& res);
 
 // ============================================================================
-//  Post-Processing
-// ============================================================================
-
-/**
- * @brief DFL (Distribution Focal Loss) decoding.
- *
- * @param x   CV_32F Mat shaped (B, 4*ch, A)
- * @param ch  Number of DFL bins (default 16)
- * @return    CV_32F Mat shaped (B, 4, A)
- */
-cv::Mat dfl_decode(const cv::Mat& x, int ch = 16);
-
-/**
- * @brief Run Non-Maximum Suppression on raw YOLO output.
- *
- * @param outputs              CV_32F Mat of shape (B, 4+nc, A)
- * @param confidence_threshold Minimum objectness threshold (default 0.001)
- * @param iou_threshold        IoU threshold for NMS (default 0.65)
- * @return                     Vector (length B) of Detection vectors
- */
-std::vector<std::vector<Detection>> non_max_suppression(
-    const cv::Mat& outputs,
-    float          confidence_threshold = 0.001f,
-    float          iou_threshold        = 0.65f);
-
-// ============================================================================
 //  YOLO Post-Processor Class
 // ============================================================================
-
+ 
+struct DetectionBatch {
+    std::vector<Detection> data;
+    int                    count;
+ 
+    Detection*       begin()       { return data.data(); }
+    Detection*       end()         { return data.data() + count; }
+    const Detection* begin() const { return data.data(); }
+    const Detection* end()   const { return data.data() + count; }
+    int              size()  const { return count; }
+};
+ 
 /**
- * @brief Decode raw YOLO multi-scale feature maps into box + class predictions.
+ * @brief YOLO 後處理 + NMS 一體化管線。
  *
- * Usage:
- *   YOLOPostProcessor pp(80, 16, {8, 16, 32});
- *   cv::Mat result = pp(feature_maps);
+ * 建構時預算所有與模型尺寸相關的不變量：
+ *   - anchors / stride 座標表
+ *   - pipeline tensor buffer（x_cat, dfl_out, output）
+ *   - NMS 暫存 buffer（固定大小，用 count 控制有效長度）
+ *   - 所有 tensor 的 row pointer 快取（O(B·C) 個 float*）
+ *   - concat 用的 scale offset 表
+ *   - NMS 用的 class offset 表（避免重複 class_id × max_wh）
+ *   - DFL 的 arange 權重
+ *
+ * 推理期 operator()/decode()/nms() 完全不動態配置記憶體。
  */
 class YOLOPostProcessor {
 public:
-    /**
-     * @param nc      Number of classes (e.g. 80 for COCO). Default: 80
-     * @param ch      DFL bins per coordinate. Default: 16
-     * @param strides Downsampling strides for each scale. Default: {8,16,32}
-     */
-    explicit YOLOPostProcessor(int                nc      = 80,
-                               int                ch      = 16,
-                               std::vector<int>   strides = {8, 16, 32});
+    YOLOPostProcessor(int batch,
+                      int input_h,
+                      int input_w,
+                      int nc       = 80,
+                      int ch       = 16,
+                      std::vector<int> strides = {8, 16, 32},
+                      int max_nms  = 5000,
+                      int max_det  = 100);
+ 
+    const std::vector<DetectionBatch>& process(
+        const std::vector<cv::Mat>& feature_maps,
+        float confidence_threshold = 0.25f,
+        float iou_threshold        = 0.45f);
 
-    /**
-     * @brief Decode feature maps.
-     *
-     * @param x           List of feature maps, each CV_32F (B, no, H*W) or (B, no, H, W)
-     * @param conf_thresh Confidence threshold (informational; NMS applies filtering)
-     * @return            CV_32F Mat (B, 4+nc, A) — [cx,cy,w,h, cls_score...]
-     */
-    cv::Mat operator()(const std::vector<cv::Mat>& x,
-                       float                        conf_thresh = 0.25f) const;
-
+    // 早期過濾式 decode：
+    //   先做 classify + mask（logit-space 比較），產生 active anchor table。
+    //   DFL decode / dist2bbox 都只對 active anchor 計算，低分框完全略過。
+    //
+    // conf_thresh 必須 > 0；使用 conf_thresh=0 會讓所有 anchor 通過過濾，
+    // 等同退化為全量 decode（不建議這樣用，失去本設計初衷）。
+    const cv::Mat& decode(const std::vector<cv::Mat>& feature_maps,
+                          float conf_thresh);
+    void           nms(float confidence_threshold, float iou_threshold);
+ 
+    const std::vector<DetectionBatch>& detections() const { return detections_; }
+    const cv::Mat& raw_output()                    const { return output_; }
+    int            total_anchors()                 const { return A_; }
+ 
 private:
-    int              nc_;
-    int              ch_;
-    int              no_;
+    // ── 固定參數 ──
+    int B_, input_h_, input_w_, nc_, ch_, no_;
     std::vector<int> strides_;
+    int max_nms_, max_det_;
+ 
+    // ── anchor 表（一次算，終身用）──
+    int     A_ = 0;
+    cv::Mat anchors_T_;                 // (2, A)
+    cv::Mat stride_T_;                  // (1, A)
+    std::vector<int> hw_per_scale_;     // 每個 scale 的 H*W
+    std::vector<int> scale_offsets_;    // ③ concat 起點 offset
+ 
+    // ── pipeline buffer ──
+    cv::Mat x_cat_, dfl_out_, output_;
+    cv::Mat box_raw_view_, cls_raw_view_;
+ 
+    // ── 預算的 raw pointer 表 ──
+    // anchors / stride（1D）
+    const float* ax_ = nullptr;
+    const float* ay_ = nullptr;
+    const float* sv_ = nullptr;
+ 
+    // ① output 各 channel 在每個 batch 的 row pointer
+    //     output_cx_rows_[b] 指向 output_[b, 0, :]
+    std::vector<float*> output_cx_rows_;       // (B,)
+    std::vector<float*> output_cy_rows_;
+    std::vector<float*> output_w_rows_;
+    std::vector<float*> output_h_rows_;
+    std::vector<std::vector<float*>> output_cls_rows_;  // (B, nc)
+ 
+    // ② dfl_out 各方向的 row pointer（(B, 4)）
+    std::vector<std::array<float*, 4>> dfl_rows_;        // dfl_rows_[b][coord]
+ 
+    // ② box_raw / cls_raw 的 row pointer
+    //     box_raw_rows_[b][coord*ch + c]
+    std::vector<std::vector<const float*>> box_raw_rows_;   // (B, 4*ch)
+    std::vector<std::vector<const float*>> cls_raw_rows_;   // (B, nc)
+ 
+    // x_cat 的 row pointer（concat 用）
+    std::vector<std::vector<float*>> xcat_rows_;            // (B, no)
+ 
+    // ── NMS 相關 ──
+    std::vector<std::array<float, 6>> candidates_;
+    int                               cand_count_ = 0;
+    std::vector<cv::Rect2d>           boxes_cv_;
+    std::vector<float>                scores_cv_;
+    std::vector<int>                  indices_;
+    std::vector<DetectionBatch>       detections_;
+
+    // ── 早期過濾：classify → threshold → 產生 active anchor table ──
+    // 大多數 anchor 的 max class logit 都會低於 conf_thresh（訓練後 YOLO
+    // 的背景 anchor logits 通常 << 0），可跳過後續的 DFL decode /
+    // dist2bbox / NMS 掃描，省下大量 expf 計算。
+    float conf_thresh_cached_ = -1.f;       // decode() 時暫存當次門檻
+    std::vector<std::vector<int>>    active_indices_;     // (B,) 每 batch 的 active anchor index
+    std::vector<std::vector<float>>  active_max_score_;   // (B,) 對應 max cls score（sigmoid 後）
+    std::vector<std::vector<int>>    active_max_cls_;     // (B,) 對應 argmax class id
+    // 若 nc > 1 且要支援 multi-label NMS（同 anchor 多 class 都過門檻），
+    // 則再用 per-active-anchor 的 sigmoid buffer。這裡 lazy-allocate。
+    std::vector<std::vector<float>>  active_cls_scores_;  // (B,) flat, size = n_active * nc
+ 
+    // ④ class_id × max_wh 的 offset 表
+    std::vector<float> class_offsets_;   // (nc,)
+ 
+    // ⑤ DFL 的 arange 權重（0..ch-1）
+    std::vector<float> dfl_arange_;      // (ch,)
+ 
+    // ── 初始化 ──
+    void precompute_anchors();
+    void precompute_tables();            // ③④⑤
+    void allocate_buffers();
+    void bind_views();
+    void cache_pointers();               // ①②
+    void cache_row_pointers_for_fmap(const std::vector<cv::Mat>& x);
+ 
+    // ── pipeline ──
+    void classify_and_build_mask(float conf_thresh);   // logit max → active list
+    void dfl_decode_masked();                          // 只處理 active anchor
+    void dist2bbox_masked();                           // 只處理 active anchor
+    void nms_single_batch(int b, float conf_thresh, float iou_thresh);
 };
+
 
 // ============================================================================
 //  Visualization

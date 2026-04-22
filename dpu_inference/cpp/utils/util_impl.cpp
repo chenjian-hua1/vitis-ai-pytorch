@@ -4,8 +4,18 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <cfloat>
 #include <numeric>
 #include <stdexcept>
+
+// ============================================================================
+//  編譯器提示巨集（SIMD / 向量化友善）
+// ============================================================================
+#if defined(__GNUC__) || defined(__clang__)
+#  define RESTRICT __restrict__
+#else
+#  define RESTRICT
+#endif
 
 // ============================================================================
 //  ImageNet normalisation constants (mirrors Python globals)
@@ -76,15 +86,21 @@ cv::Mat wh2xy(const cv::Mat& x)
     assert(x.cols >= 4 && x.type() == CV_32F);
     cv::Mat y = x.clone();
 
-    for (int i = 0; i < x.rows; ++i) {
-        const float cx = x.at<float>(i, 0);
-        const float cy = x.at<float>(i, 1);
-        const float w  = x.at<float>(i, 2);
-        const float h  = x.at<float>(i, 3);
-        y.at<float>(i, 0) = cx - w * 0.5f;   // x1
-        y.at<float>(i, 1) = cy - h * 0.5f;   // y1
-        y.at<float>(i, 2) = cx + w * 0.5f;   // x2
-        y.at<float>(i, 3) = cy + h * 0.5f;   // y2
+    const int N    = x.rows;
+    const int cols = x.cols;
+    const float* RESTRICT src = x.ptr<float>();
+    float*       RESTRICT dst = y.ptr<float>();
+
+    #pragma omp simd
+    for (int i = 0; i < N; ++i) {
+        const float cx = src[i * cols + 0];
+        const float cy = src[i * cols + 1];
+        const float w  = src[i * cols + 2];
+        const float h  = src[i * cols + 3];
+        dst[i * cols + 0] = cx - w * 0.5f;   // x1
+        dst[i * cols + 1] = cy - h * 0.5f;   // y1
+        dst[i * cols + 2] = cx + w * 0.5f;   // x2
+        dst[i * cols + 3] = cy + h * 0.5f;   // y2
     }
     return y;
 }
@@ -95,9 +111,14 @@ cv::Mat xyxy2xywh(const cv::Mat& box)
     assert(box.cols == 4 && box.type() == CV_32F);
     cv::Mat out = box.clone();
 
-    for (int i = 0; i < box.rows; ++i) {
-        out.at<float>(i, 2) = box.at<float>(i, 2) - box.at<float>(i, 0); // w
-        out.at<float>(i, 3) = box.at<float>(i, 3) - box.at<float>(i, 1); // h
+    const int N = box.rows;
+    const float* RESTRICT src = box.ptr<float>();
+    float*       RESTRICT dst = out.ptr<float>();
+
+    #pragma omp simd
+    for (int i = 0; i < N; ++i) {
+        dst[i * 4 + 2] = src[i * 4 + 2] - src[i * 4 + 0]; // w
+        dst[i * 4 + 3] = src[i * 4 + 3] - src[i * 4 + 1]; // h
     }
     return out;
 }
@@ -151,12 +172,14 @@ void norm(const cv::Mat& x, cv::Mat& out)
 
     out.create(x.rows, x.cols, CV_32FC3);
 
-    const uchar* src = x.ptr<uchar>();
-    float* dst = out.ptr<float>();
+    const uchar* RESTRICT src = x.ptr<uchar>();
+    float*       RESTRICT dst = out.ptr<float>();
 
-    int total = x.rows * x.cols;
+    const int total = x.rows * x.cols;
 
-    // Parellel Optimize dataflow & Memory Access
+    // interleaved BGR(x3)，stride 3 的 layout 編譯器通常需要 pragma 提示
+    // 才會生成 NEON ld3/st3 指令。
+    #pragma omp simd
     for (int i = 0; i < total; i++) {
         dst[3*i + 0] = src[3*i + 0] * kU8ScaleR + kU8BiasR;
         dst[3*i + 1] = src[3*i + 1] * kU8ScaleG + kU8BiasG;
@@ -196,265 +219,519 @@ void resize(const cv::Mat& img, int input_size, ResizeResult& res)
     cv::resize(img, roi, roi.size(), 0, 0, cv::INTER_LINEAR);
 }
 
-// ============================================================================
-//  Post-Processing — DFL
-// ============================================================================
-
-cv::Mat dfl_decode(const cv::Mat& x, int ch)
-{
-    // x : (B, 4*ch, A)  stored as a 3-dim Mat
-    int B = x.size[0];
-    int A = x.size[2];
-
-    cv::Mat out(std::vector<int>{B, 4, A}, CV_32F);
-
-    // arange weights [0, 1, ..., ch-1]
-    std::vector<float> arange(ch);
-    std::iota(arange.begin(), arange.end(), 0.f);
-
-    for (int b = 0; b < B; ++b) {
-        for (int coord = 0; coord < 4; ++coord) {
-            for (int a = 0; a < A; ++a) {
-                // Gather the ch logits for this (b, coord, a)
-                std::vector<float> logits(ch);
-                for (int c = 0; c < ch; ++c) {
-                    // x[b, coord*ch + c, a]
-                    logits[c] = x.at<float>(
-                        std::vector<int>{b, coord * ch + c, a}.data());
-                }
-
-                // Numerically stable softmax
-                float max_l = *std::max_element(logits.begin(), logits.end());
-                float sum_e = 0.f;
-                for (int c = 0; c < ch; ++c) {
-                    logits[c] = std::exp(logits[c] - max_l);
-                    sum_e += logits[c];
-                }
-
-                // Weighted sum (DFL expectation)
-                float val = 0.f;
-                for (int c = 0; c < ch; ++c) {
-                    val += (logits[c] / sum_e) * arange[c];
-                }
-                out.at<float>(std::vector<int>{b, coord, a}.data()) = val;
-            }
-        }
-    }
-    return out;
-}
-
-// ============================================================================
-//  Post-Processing — NMS
-// ============================================================================
-
-std::vector<std::vector<Detection>> non_max_suppression(
-    const cv::Mat& outputs,
-    float          confidence_threshold,
-    float          iou_threshold)
-{
-    constexpr float max_wh  = 7680.f;
-    constexpr int   max_det = 300;
-    constexpr int   max_nms = 30000;
-
-    int B  = outputs.size[0];
-    int nc = outputs.size[1] - 4;
-    int A  = outputs.size[2];
-
-    std::vector<std::vector<Detection>> result(B);
-
-    auto t_start = std::chrono::steady_clock::now();
-    float limit  = 0.5f + 0.05f * B;
-
-    for (int b = 0; b < B; ++b) {
-        // Collect candidate rows
-        // Each candidate: [x1, y1, x2, y2, score, class_id]
-        std::vector<std::array<float,6>> candidates;
-        candidates.reserve(512);
-
-        for (int a = 0; a < A; ++a) {
-            // Find max class score across nc classes
-            float max_cls = -1e9f;
-            for (int c = 0; c < nc; ++c) {
-                float v = outputs.at<float>(
-                    std::vector<int>{b, 4 + c, a}.data());
-                if (v > max_cls) max_cls = v;
-            }
-            if (max_cls <= confidence_threshold) continue;
-
-            // Decode box (cx,cy,w,h → x1,y1,x2,y2)
-            float cx = outputs.at<float>(std::vector<int>{b,0,a}.data());
-            float cy = outputs.at<float>(std::vector<int>{b,1,a}.data());
-            float w  = outputs.at<float>(std::vector<int>{b,2,a}.data());
-            float h  = outputs.at<float>(std::vector<int>{b,3,a}.data());
-            float x1 = cx - w * 0.5f, y1 = cy - h * 0.5f;
-            float x2 = cx + w * 0.5f, y2 = cy + h * 0.5f;
-
-            if (nc > 1) {
-                for (int c = 0; c < nc; ++c) {
-                    float score = outputs.at<float>(
-                        std::vector<int>{b, 4 + c, a}.data());
-                    if (score > confidence_threshold) {
-                        candidates.push_back({x1, y1, x2, y2, score,
-                                              static_cast<float>(c)});
-                    }
-                }
-            } else {
-                float score = outputs.at<float>(std::vector<int>{b,4,a}.data());
-                if (score > confidence_threshold) {
-                    candidates.push_back({x1, y1, x2, y2, score, 0.f});
-                }
-            }
-        }
-
-        if (candidates.empty()) continue;
-
-        // Sort by score descending, keep top max_nms
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const auto& a, const auto& b){ return a[4] > b[4]; });
-        if ((int)candidates.size() > max_nms)
-            candidates.resize(max_nms);
-
-        // Build offset boxes for batched NMS
-        std::vector<cv::Rect2d> boxes_cv;
-        std::vector<float>      scores_cv;
-        boxes_cv.reserve(candidates.size());
-        scores_cv.reserve(candidates.size());
-
-        for (const auto& c : candidates) {
-            float off = c[5] * max_wh;
-            float ox1 = c[0] + off, oy1 = c[1] + off;
-            float ow  = c[2] - c[0], oh = c[3] - c[1];
-            boxes_cv.emplace_back(ox1, oy1, ow, oh);
-            scores_cv.push_back(c[4]);
-        }
-
-        std::vector<int> indices;
-        cv::dnn::NMSBoxes(boxes_cv, scores_cv,
-                          confidence_threshold, iou_threshold, indices);
-
-        int keep = std::min((int)indices.size(), max_det);
-        result[b].reserve(keep);
-        for (int k = 0; k < keep; ++k) {
-            const auto& row = candidates[indices[k]];
-            result[b].push_back({row[0], row[1], row[2], row[3],
-                                  row[4], static_cast<int>(row[5])});
-        }
-
-        // Time guard
-        auto elapsed = std::chrono::duration<float>(
-            std::chrono::steady_clock::now() - t_start).count();
-        if (elapsed > limit) break;
-    }
-
-    return result;
-}
 
 // ============================================================================
 //  YOLOPostProcessor
 // ============================================================================
 
-YOLOPostProcessor::YOLOPostProcessor(int nc, int ch, std::vector<int> strides)
-    : nc_(nc), ch_(ch), no_(nc + ch * 4), strides_(std::move(strides))
-{}
+// ═══════════════ ctor ═══════════════
 
-cv::Mat YOLOPostProcessor::operator()(const std::vector<cv::Mat>& x,
-                                       float /*conf_thresh*/) const
+YOLOPostProcessor::YOLOPostProcessor(int batch,
+                                      int input_h,
+                                      int input_w,
+                                      int nc,
+                                      int ch,
+                                      std::vector<int> strides,
+                                      int max_nms,
+                                      int max_det)
+    : B_(batch),
+      input_h_(input_h),
+      input_w_(input_w),
+      nc_(nc),
+      ch_(ch),
+      no_(nc + ch * 4),
+      strides_(std::move(strides)),
+      max_nms_(max_nms),
+      max_det_(max_det)
 {
-    int B = x[0].size[0];
+    precompute_anchors();    // anchors_T_ / stride_T_ / scale_offsets_
+    allocate_buffers();      // x_cat_ / dfl_out_ / output_ / NMS buffer / detections_
+    bind_views();            // box_raw_view_ / cls_raw_view_
+    cache_pointers();        // ①② 所有 row pointer + anchors / stride 指標
+    precompute_tables();     // ④ class_offsets_ ⑤ dfl_arange_
+}
 
-    // 1. Generate anchors (A, 2) and stride_tensor (A, 1)
-    auto [anchors_mat, stride_vals] = make_anchors(x, strides_);
-    // Transpose anchors → (2, A)
-    cv::Mat anchors_T;
-    cv::transpose(anchors_mat, anchors_T); // (2, A)
-    // stride_vals (A, 1) → (1, A)
-    cv::Mat sv_T;
-    cv::transpose(stride_vals, sv_T); // (1, A)
 
-    // 2. Concatenate all scales → (B, no, A)
-    int A = anchors_T.cols;
-    cv::Mat x_cat(std::vector<int>{B, no_, A}, CV_32F);
-    int col_offset = 0;
-    for (const auto& xi : x) {
-        int hw = xi.size[2] * xi.size[3];
-        for (int b = 0; b < B; ++b) {
-            for (int c = 0; c < no_; ++c) {
-                int h_dim = xi.size[2];
-                int w_dim = xi.size[3];
-                for (int gy = 0; gy < h_dim; ++gy) {
-                    for (int gx = 0; gx < w_dim; ++gx) {
-                        int a = gy * w_dim + gx;
-                        x_cat.at<float>(std::vector<int>{b, c, col_offset + a}.data())
-                            = xi.at<float>(std::vector<int>{b, c, gy, gx}.data());
-                    }
-                }
-            }
-        }
-        col_offset += hw;
+// ═══════════════ 初始化 ═══════════════
+
+void YOLOPostProcessor::precompute_anchors()
+{
+    constexpr float offset = 0.5f;
+
+    hw_per_scale_.clear();
+    scale_offsets_.clear();
+    std::vector<std::pair<int,int>> hw_list;
+    A_ = 0;
+    int acc_offset = 0;
+    for (int stride : strides_) {
+        if (input_h_ % stride != 0 || input_w_ % stride != 0)
+            throw std::runtime_error("input size not divisible by stride");
+        int H = input_h_ / stride;
+        int W = input_w_ / stride;
+        hw_list.emplace_back(H, W);
+        hw_per_scale_.push_back(H * W);
+        scale_offsets_.push_back(acc_offset);  // ③
+        acc_offset += H * W;
+        A_ += H * W;
     }
 
-    // 3. Split into box_raw (B, 4*ch, A) and cls_raw (B, nc, A)
-    int split = 4 * ch_;
-    cv::Mat box_raw(std::vector<int>{B, split, A}, CV_32F);
-    cv::Mat cls_raw(std::vector<int>{B, nc_,   A}, CV_32F);
+    anchors_T_ = cv::Mat(2, A_, CV_32F);
+    stride_T_  = cv::Mat(1, A_, CV_32F);
 
-    for (int b = 0; b < B; ++b)
-        for (int a = 0; a < A; ++a) {
-            for (int c = 0; c < split; ++c)
-                box_raw.at<float>(std::vector<int>{b,c,a}.data())
-                    = x_cat.at<float>(std::vector<int>{b,c,a}.data());
-            for (int c = 0; c < nc_; ++c)
-                cls_raw.at<float>(std::vector<int>{b,c,a}.data())
-                    = x_cat.at<float>(std::vector<int>{b, split+c, a}.data());
-        }
+    int col = 0;
+    for (size_t i = 0; i < strides_.size(); ++i) {
+        int H = hw_list[i].first;
+        int W = hw_list[i].second;
+        float s = static_cast<float>(strides_[i]);
+        for (int gy = 0; gy < H; ++gy)
+            for (int gx = 0; gx < W; ++gx, ++col) {
+                anchors_T_.at<float>(0, col) = static_cast<float>(gx) + offset;
+                anchors_T_.at<float>(1, col) = static_cast<float>(gy) + offset;
+                stride_T_.at<float>(0, col)  = s;
+            }
+    }
+}
 
-    // 4. DFL decoding → (B, 4, A)
-    cv::Mat dfl_out = dfl_decode(box_raw, ch_);
 
-    // 5. dist2bbox → cxcywh, scaled to image space
-    //    a = anchors[np.newaxis] - dfl_out[:, :2, :]
-    //    b = anchors[np.newaxis] + dfl_out[:, 2:, :]
-    cv::Mat box(std::vector<int>{B, 4, A}, CV_32F);
-    for (int b = 0; b < B; ++b)
-        for (int a = 0; a < A; ++a) {
-            float lt_x = anchors_T.at<float>(0, a)
-                         - dfl_out.at<float>(std::vector<int>{b,0,a}.data());
-            float lt_y = anchors_T.at<float>(1, a)
-                         - dfl_out.at<float>(std::vector<int>{b,1,a}.data());
-            float rb_x = anchors_T.at<float>(0, a)
-                         + dfl_out.at<float>(std::vector<int>{b,2,a}.data());
-            float rb_y = anchors_T.at<float>(1, a)
-                         + dfl_out.at<float>(std::vector<int>{b,3,a}.data());
-            float stride = sv_T.at<float>(0, a);
-            box.at<float>(std::vector<int>{b,0,a}.data()) = (lt_x + rb_x) * 0.5f * stride; // cx
-            box.at<float>(std::vector<int>{b,1,a}.data()) = (lt_y + rb_y) * 0.5f * stride; // cy
-            box.at<float>(std::vector<int>{b,2,a}.data()) = (rb_x - lt_x) * stride;         // w
-            box.at<float>(std::vector<int>{b,3,a}.data()) = (rb_y - lt_y) * stride;         // h
-        }
+void YOLOPostProcessor::allocate_buffers()
+{
+    // cv::Mat 的 data pointer 預設對齊到 CV_MALLOC_ALIGN（通常 64 byte），
+    // 對 NEON（16 byte）的對齊需求綽綽有餘。
+    x_cat_   = cv::Mat(std::vector<int>{B_, no_,     A_}, CV_32F);
+    dfl_out_ = cv::Mat(std::vector<int>{B_, 4,       A_}, CV_32F);
+    output_  = cv::Mat(std::vector<int>{B_, 4 + nc_, A_}, CV_32F);
 
-    // 6. Class sigmoid
-    cv::Mat cls_prob(std::vector<int>{B, nc_, A}, CV_32F);
-    for (int b = 0; b < B; ++b)
+    candidates_.resize(max_nms_);
+    boxes_cv_.resize(max_nms_);
+    scores_cv_.resize(max_nms_);
+    indices_.reserve(max_nms_);
+
+    detections_.resize(B_);
+    for (auto& db : detections_) {
+        db.data.resize(max_det_);
+        db.count = 0;
+    }
+
+    // ── active anchor 相關 buffer（上限為 A_，實際長度由 vector 自己管）──
+    active_indices_.assign(B_, {});
+    active_max_score_.assign(B_, {});
+    active_max_cls_.assign(B_, {});
+    active_cls_scores_.assign(B_, {});
+    for (int b = 0; b < B_; ++b) {
+        active_indices_[b].reserve(A_);
+        active_max_score_[b].reserve(A_);
+        active_max_cls_[b].reserve(A_);
+        active_cls_scores_[b].reserve(A_ * nc_);  // 上界，實際用多少看 active 數
+    }
+}
+
+
+void YOLOPostProcessor::bind_views()
+{
+    const int split = 4 * ch_;
+    cv::Range box_r[] = { cv::Range::all(), cv::Range(0, split),   cv::Range::all() };
+    cv::Range cls_r[] = { cv::Range::all(), cv::Range(split, no_), cv::Range::all() };
+    box_raw_view_ = x_cat_(box_r);
+    cls_raw_view_ = x_cat_(cls_r);
+}
+
+
+void YOLOPostProcessor::cache_pointers()
+{
+    // anchors / stride
+    ax_ = anchors_T_.ptr<float>(0);
+    ay_ = anchors_T_.ptr<float>(1);
+    sv_ = stride_T_.ptr<float>(0);
+
+    // ── ① output 的 row pointer ──
+    output_cx_rows_.resize(B_);
+    output_cy_rows_.resize(B_);
+    output_w_rows_.resize(B_);
+    output_h_rows_.resize(B_);
+    output_cls_rows_.assign(B_, std::vector<float*>(nc_, nullptr));
+
+    for (int b = 0; b < B_; ++b) {
+        output_cx_rows_[b] = output_.ptr<float>(b, 0);
+        output_cy_rows_[b] = output_.ptr<float>(b, 1);
+        output_w_rows_[b]  = output_.ptr<float>(b, 2);
+        output_h_rows_[b]  = output_.ptr<float>(b, 3);
         for (int c = 0; c < nc_; ++c)
-            for (int a = 0; a < A; ++a) {
-                float v = cls_raw.at<float>(std::vector<int>{b,c,a}.data());
-                cls_prob.at<float>(std::vector<int>{b,c,a}.data())
-                    = 1.f / (1.f + std::exp(-v));
+            output_cls_rows_[b][c] = output_.ptr<float>(b, 4 + c);
+    }
+
+    // ── ② dfl_out 的 row pointer ──
+    dfl_rows_.resize(B_);
+    for (int b = 0; b < B_; ++b)
+        for (int coord = 0; coord < 4; ++coord)
+            dfl_rows_[b][coord] = dfl_out_.ptr<float>(b, coord);
+
+    // ── ② box_raw / cls_raw 的 row pointer（view 的 ptr 指向 x_cat_ 的記憶體）──
+    const int split = 4 * ch_;
+    box_raw_rows_.assign(B_, std::vector<const float*>(split, nullptr));
+    cls_raw_rows_.assign(B_, std::vector<const float*>(nc_,   nullptr));
+    for (int b = 0; b < B_; ++b) {
+        for (int c = 0; c < split; ++c)
+            box_raw_rows_[b][c] = box_raw_view_.ptr<float>(b, c);
+        for (int c = 0; c < nc_; ++c)
+            cls_raw_rows_[b][c] = cls_raw_view_.ptr<float>(b, c);
+    }
+
+    // ── x_cat_ 的 row pointer（concat 寫入用）──
+    xcat_rows_.assign(B_, std::vector<float*>(no_, nullptr));
+    for (int b = 0; b < B_; ++b)
+        for (int c = 0; c < no_; ++c)
+            xcat_rows_[b][c] = x_cat_.ptr<float>(b, c);
+}
+
+
+void YOLOPostProcessor::precompute_tables()
+{
+    // ── ④ class_id × max_wh ──
+    constexpr float max_wh = 7680.f;
+    class_offsets_.resize(nc_);
+    for (int c = 0; c < nc_; ++c)
+        class_offsets_[c] = static_cast<float>(c) * max_wh;
+
+    // ── ⑤ DFL arange [0, 1, ..., ch-1] ──
+    dfl_arange_.resize(ch_);
+    std::iota(dfl_arange_.begin(), dfl_arange_.end(), 0.f);
+}
+
+
+
+
+// ═══════════════ decode pipeline（全稀疏版本）═══════════════
+//
+//  設計目標：decode 時就跳過低分 anchor，不做任何 dense 計算。
+//
+//  Pipeline：
+//    1. concat feature maps → x_cat_（仍是 dense，memcpy 本身不是瓶頸）
+//    2. classify_and_build_mask(conf_thresh):
+//         - 對每個 anchor 在 **logit 空間** 找 max 與 argmax（純比較，無 expf）
+//         - max_logit > logit(conf_thresh) → active，放入 active_indices_
+//         - active anchor 才算 sigmoid：先算 argmax 的分數（active_max_score_），
+//           若 nc > 1 則再逐 class 算 sigmoid 放入 active_cls_scores_，
+//           給 NMS 做 multi-label 判斷用
+//    3. dfl_decode_masked(): 只處理 active anchor 的 DFL softmax
+//    4. dist2bbox_masked(): 只處理 active anchor 的座標轉換
+//
+//  output_ 語意：decode 後只有 active anchor 的位置被寫入，其餘位置值未定義。
+//  raw_output() 在此設計下不再有「dense tensor」的意義，若外部需要完整 tensor
+//  請呼叫端自行初始化 output_ 為零或改用 detections()。
+//
+//  備註：YOLO v8/v11 分類分支是 multi-label sigmoid。比較門檻時利用
+//        sigmoid 的單調性，在 logit 空間用 x > log(t/(1-t)) 代替，免去 expf。
+
+
+void YOLOPostProcessor::classify_and_build_mask(float conf_thresh)
+{
+    const int A = A_;
+
+    // sigmoid 嚴格單調：sigmoid(x) > t  ⇔  x > logit(t)
+    // 預先計算 logit(t)，後續逐 anchor 的比較完全不碰 expf。
+    const float logit_thresh = (conf_thresh > 0.f && conf_thresh < 1.f)
+        ? std::log(conf_thresh / (1.f - conf_thresh))
+        : -FLT_MAX;
+
+    for (int b = 0; b < B_; ++b) {
+        active_indices_[b].clear();
+        active_max_score_[b].clear();
+        active_max_cls_[b].clear();
+        active_cls_scores_[b].clear();
+
+        const std::vector<const float*>& cls_raw = cls_raw_rows_[b];
+
+        // ── Step A: 逐 anchor 在 logit 空間找 max + argmax，建 active list。
+        //
+        // 這個 loop 是每 anchor O(nc) 次比較，沒有 expf、沒有 memory write。
+        // 大約是 A * nc 次 load + compare — 遠比原本 dense sigmoid 的
+        // A * nc 次 expf 便宜（expf 約 8-20 個 cycle，純比較 1 cycle 內）。
+        //
+        // 若 nc 很大且分佈偏極端（例如背景 logit << 0），這裡其實還可以做
+        // "early break on first positive"，但會破壞 argmax 語意。保持完整
+        // 掃描換取正確的 argmax。
+        //
+        // 註：這個 loop 不向量化（因為有 conditional push_back），但大部分
+        //    anchor 會 fail 過濾條件而直接跳過後續工作，實際成本主要就是
+        //    nc 次 load + max reduction。
+        for (int a = 0; a < A; ++a) {
+            // 找 max logit + argmax
+            float max_l  = cls_raw[0][a];
+            int   max_id = 0;
+            for (int c = 1; c < nc_; ++c) {
+                float v = cls_raw[c][a];
+                if (v > max_l) { max_l = v; max_id = c; }
             }
 
-    // 7. Concatenate box + cls → (B, 4+nc, A)
-    cv::Mat output(std::vector<int>{B, 4 + nc_, A}, CV_32F);
-    for (int b = 0; b < B; ++b)
-        for (int a = 0; a < A; ++a) {
-            for (int c = 0; c < 4; ++c)
-                output.at<float>(std::vector<int>{b,c,a}.data())
-                    = box.at<float>(std::vector<int>{b,c,a}.data());
-            for (int c = 0; c < nc_; ++c)
-                output.at<float>(std::vector<int>{b, 4+c, a}.data())
-                    = cls_prob.at<float>(std::vector<int>{b,c,a}.data());
+            if (max_l <= logit_thresh) continue;   // 低分 anchor，完全略過
+
+            active_indices_[b].push_back(a);
+            // 只對 argmax 算 sigmoid（比算完整 nc 條便宜 nc 倍）
+            float max_s = 1.f / (1.f + expf(-max_l));
+            active_max_score_[b].push_back(max_s);
+            active_max_cls_[b].push_back(max_id);
         }
 
-    return output;
+        const int n_active = static_cast<int>(active_indices_[b].size());
+
+        // ── Step B（僅 nc > 1）: 對 active anchor 計算完整的 nc 個 sigmoid，
+        //    供 NMS multi-label 分支使用（同一 anchor 可能多個 class 過門檻）。
+        //
+        // 成本：n_active * nc 次 expf，遠小於原版 dense 的 A * nc。
+        // layout: active_cls_scores_[b][i * nc + c] = sigmoid(cls_raw[c][act[i]])
+        if (nc_ > 1 && n_active > 0) {
+            auto& scores = active_cls_scores_[b];
+            scores.resize(static_cast<size_t>(n_active) * nc_);
+
+            const int* RESTRICT act = active_indices_[b].data();
+            float* RESTRICT dst = scores.data();
+
+            for (int i = 0; i < n_active; ++i) {
+                const int a = act[i];
+                float* RESTRICT row = dst + static_cast<size_t>(i) * nc_;
+                for (int c = 0; c < nc_; ++c)
+                    row[c] = 1.f / (1.f + expf(-cls_raw[c][a]));
+            }
+        }
+    }
+}
+
+
+void YOLOPostProcessor::dfl_decode_masked()
+{
+    const int ch = ch_;
+
+    for (int b = 0; b < B_; ++b) {
+        const std::vector<int>& act = active_indices_[b];
+        const int N = static_cast<int>(act.size());
+        if (N == 0) continue;
+
+        for (int coord = 0; coord < 4; ++coord) {
+            float* RESTRICT out_row = dfl_rows_[b][coord];
+            const int base = coord * ch;
+
+            // 把 ch 條 row pointer 拉到 local。ch 典型 16，上限 32。
+            const float* RESTRICT ch_rows[32];
+            for (int c = 0; c < ch; ++c)
+                ch_rows[c] = box_raw_rows_[b][base + c];
+
+            // 只迭代 active anchor。存取是 gather（非連續），但 N << A
+            // 時省下的 expf 遠大於失去的連續存取收益。
+            for (int i = 0; i < N; ++i) {
+                const int a = act[i];
+
+                // ch 個 logit 的 numerically-stable softmax + 期望值
+                float max_l = ch_rows[0][a];
+                for (int c = 1; c < ch; ++c) {
+                    float v = ch_rows[c][a];
+                    if (v > max_l) max_l = v;
+                }
+
+                float sum_e = 0.f, wsum = 0.f;
+                for (int c = 0; c < ch; ++c) {
+                    float e = expf(ch_rows[c][a] - max_l);
+                    sum_e += e;
+                    wsum  += e * dfl_arange_[c];
+                }
+                out_row[a] = wsum / sum_e;
+            }
+        }
+    }
+}
+
+
+void YOLOPostProcessor::dist2bbox_masked()
+{
+    for (int b = 0; b < B_; ++b) {
+        const std::vector<int>& act = active_indices_[b];
+        const int N = static_cast<int>(act.size());
+        if (N == 0) continue;
+
+        float* RESTRICT cx = output_cx_rows_[b];
+        float* RESTRICT cy = output_cy_rows_[b];
+        float* RESTRICT ww = output_w_rows_[b];
+        float* RESTRICT hh = output_h_rows_[b];
+        const float* RESTRICT dl = dfl_rows_[b][0];
+        const float* RESTRICT dt = dfl_rows_[b][1];
+        const float* RESTRICT dr = dfl_rows_[b][2];
+        const float* RESTRICT db = dfl_rows_[b][3];
+        const float* RESTRICT ax = ax_;
+        const float* RESTRICT ay = ay_;
+        const float* RESTRICT sv = sv_;
+
+        for (int i = 0; i < N; ++i) {
+            const int a = act[i];
+            float lt_x = ax[a] - dl[a];
+            float lt_y = ay[a] - dt[a];
+            float rb_x = ax[a] + dr[a];
+            float rb_y = ay[a] + db[a];
+            float s    = sv[a];
+
+            cx[a] = (lt_x + rb_x) * 0.5f * s;
+            cy[a] = (lt_y + rb_y) * 0.5f * s;
+            ww[a] = (rb_x - lt_x) * s;
+            hh[a] = (rb_y - lt_y) * s;
+        }
+    }
+}
+
+
+const cv::Mat& YOLOPostProcessor::decode(const std::vector<cv::Mat>& x,
+                                         float conf_thresh)
+{
+    if (x[0].size[0] != B_)
+        throw std::runtime_error("feature map batch mismatch");
+
+    const int B = B_;
+
+    // ── 1. concat → x_cat_（dense memcpy）──
+    for (size_t i = 0; i < x.size(); ++i) {
+        const auto& xi = x[i];
+        const int hw = xi.size[2] * xi.size[3];
+        const int col_offset = scale_offsets_[i];
+
+        for (int b = 0; b < B; ++b)
+            for (int c = 0; c < no_; ++c) {
+                const float* src = xi.ptr<float>(b, c);
+                float*       dst = xcat_rows_[b][c] + col_offset;
+                std::memcpy(dst, src, hw * sizeof(float));
+            }
+    }
+
+    conf_thresh_cached_ = conf_thresh;
+
+    // ── 2. classify + mask（logit-space 比較，僅 active anchor 算 sigmoid）──
+    classify_and_build_mask(conf_thresh);
+
+    // ── 3. DFL decode（僅 active anchor）──
+    dfl_decode_masked();
+
+    // ── 4. dist2bbox（僅 active anchor）──
+    dist2bbox_masked();
+
+    return output_;
+}
+
+
+// ═══════════════ NMS ═══════════════
+
+void YOLOPostProcessor::nms_single_batch(int b,
+                                          float conf_thresh,
+                                          float iou_thresh)
+{
+    cand_count_ = 0;
+
+    // decode 階段用的 conf_thresh 必須跟 NMS 一致；否則 active list 的語意
+    // 錯配。這是新設計的硬性前提（不再 fallback slow path）。
+    if (conf_thresh_cached_ != conf_thresh) {
+        throw std::runtime_error(
+            "nms conf_thresh must match the conf_thresh used in decode()");
+    }
+
+    const float* cx_row = output_cx_rows_[b];
+    const float* cy_row = output_cy_rows_[b];
+    const float* ww_row = output_w_rows_[b];
+    const float* hh_row = output_h_rows_[b];
+
+    const std::vector<int>&   act         = active_indices_[b];
+    const std::vector<float>& max_score   = active_max_score_[b];
+    const std::vector<int>&   max_cls     = active_max_cls_[b];
+    const std::vector<float>& cls_scores  = active_cls_scores_[b];   // 僅 nc>1 時有效
+    const int N = static_cast<int>(act.size());
+
+    for (int i = 0; i < N; ++i) {
+        const int a = act[i];
+
+        // decode 時已用 max_logit > logit_thresh 濾過，max_score[i] > conf_thresh
+        // 嚴格成立；不用再檢查。
+        float cx = cx_row[a], cy = cy_row[a];
+        float w  = ww_row[a], h  = hh_row[a];
+        float x1 = cx - w * 0.5f, y1 = cy - h * 0.5f;
+        float x2 = cx + w * 0.5f, y2 = cy + h * 0.5f;
+
+        if (nc_ > 1) {
+            // multi-label：同一 anchor 可能有多個 class 過門檻。讀預算好的
+            // active_cls_scores_[b] 的第 i 列（長度 nc）。
+            const float* RESTRICT row = cls_scores.data()
+                                      + static_cast<size_t>(i) * nc_;
+            for (int c = 0; c < nc_; ++c) {
+                float score = row[c];
+                if (score > conf_thresh && cand_count_ < max_nms_) {
+                    candidates_[cand_count_++] = {
+                        x1, y1, x2, y2, score, static_cast<float>(c)
+                    };
+                }
+            }
+        } else {
+            // nc == 1：max_score[i] 就是唯一的 class score。
+            (void)max_cls;
+            float score = max_score[i];
+            if (cand_count_ < max_nms_) {
+                candidates_[cand_count_++] = {x1, y1, x2, y2, score, 0.f};
+            }
+        }
+
+        if (cand_count_ >= max_nms_) break;
+    }
+
+    if (cand_count_ == 0) {
+        detections_[b].count = 0;
+        return;
+    }
+
+    std::sort(candidates_.begin(),
+              candidates_.begin() + cand_count_,
+              [](const auto& a, const auto& b){ return a[4] > b[4]; });
+
+    // ── 組 offset 框，用 class_offsets_ 查表 ──
+    for (int i = 0; i < cand_count_; ++i) {
+        const auto& c = candidates_[i];
+        int   cls_id = static_cast<int>(c[5]);
+        float off    = class_offsets_[cls_id];
+        boxes_cv_[i]  = cv::Rect2d(c[0] + off, c[1] + off,
+                                    c[2] - c[0], c[3] - c[1]);
+        scores_cv_[i] = c[4];
+    }
+
+    boxes_cv_.resize(cand_count_);
+    scores_cv_.resize(cand_count_);
+
+    cv::dnn::NMSBoxes(boxes_cv_, scores_cv_,
+                      conf_thresh, iou_thresh, indices_);
+
+    boxes_cv_.resize(max_nms_);
+    scores_cv_.resize(max_nms_);
+
+    int keep = std::min(static_cast<int>(indices_.size()), max_det_);
+    auto& db = detections_[b];
+    for (int k = 0; k < keep; ++k) {
+        const auto& row = candidates_[indices_[k]];
+        db.data[k] = Detection{
+            row[0], row[1], row[2], row[3],
+            row[4], static_cast<int>(row[5])
+        };
+    }
+    db.count = keep;
+}
+
+
+void YOLOPostProcessor::nms(float conf_thresh, float iou_thresh)
+{
+    for (int b = 0; b < B_; ++b)
+        nms_single_batch(b, conf_thresh, iou_thresh);
+}
+
+
+const std::vector<DetectionBatch>& YOLOPostProcessor::process(
+    const std::vector<cv::Mat>& feature_maps,
+    float conf_thresh,
+    float iou_thresh)
+{
+    // 把 conf_thresh 一併帶進 decode，啟用「先 classify → mask → 只 decode
+    // active anchor」的 fast path。
+    decode(feature_maps, conf_thresh);
+    nms(conf_thresh, iou_thresh);
+    return detections_;
 }
 
 // ============================================================================
