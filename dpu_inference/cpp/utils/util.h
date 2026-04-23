@@ -3,8 +3,11 @@
 #include <vector>
 #include <string>
 #include <tuple>
+#include <memory>
+#include <functional>
 
 #include <opencv2/opencv.hpp>
+#include <onnxruntime_cxx_api.h>
 
 // ============================================================================
 //  Data Structures
@@ -41,21 +44,27 @@ struct Detection {
 // ============================================================================
 
 /**
- * @brief Convert int8 fixed-point array to float32.
+ * @brief Convert int8 fixed-point array to float32, preserving channel count.
  *
- * @param data      CV_8S Mat of fixed-point values
+ * @param data      Fixed-point input (CV_8SC1 or CV_8SC3)
  * @param fix_point Exponent (scale = 2^(-fix_point))
- * @param out       CV_32F Mat reused across calls to avoid repeated allocation.
+ * @param out       Float32 output, same channel count as input,
+ *                  reused across calls to avoid repeated allocation.
+ *
+ * @note  簽章刻意使用 cv::Mat&（不是 cv::Mat_<float>&）。Mat_<T> 是 OpenCV 的
+ *        「強制單通道 typed view」，當 OutputArray 被要求 reshape 時會把 3-channel
+ *        資料重新詮釋為 CV_32FC1 / cols*3。下游若要嚴格 assert CV_32FC3 就會失敗。
+ *        使用 cv::Mat& 搭配完整型別 (CV_32FC3) 可以保留正確的 channel header。
  */
 void fix2float(const cv::Mat& data, int fix_point, cv::Mat& out);
 
 /**
- * @brief Convert float32 array to int8 fixed-point.
+ * @brief Convert float32 array to int8 fixed-point, preserving channel count.
  *
- * @param data      CV_32F Mat
+ * @param data      Float32 input (CV_32FC1 or CV_32FC3)
  * @param fix_point Exponent (scale = 2^fix_point)
- * @param out       CV_8S Mat clipped to [-128, 127],
- *                  reused across calls to avoid repeated allocation.
+ * @param out       Fixed-point output, same channel count as input,
+ *                  clipped to [-128, 127], reused across calls.
  */
 void float2fix(const cv::Mat& data, int fix_point, cv::Mat& out);
 
@@ -295,3 +304,94 @@ cv::Mat scale_boxes(const cv::Mat&              boxes,
 cv::Mat draw_boxes(const cv::Mat&                    img,
                    const std::vector<Detection>&     detections,
                    const std::vector<std::string>&   class_names = {});
+
+
+// ============================================================================
+//  ONNX Runtime Inference Engine
+// ============================================================================
+//
+//  一個 session 對應一顆模型。整個類別只配一次記憶體：
+//    - input_tensor_values_ : NCHW float buffer（HWC→NCHW 轉換目的地）
+//    - outputs_             : 每個輸出一個 cv::Mat (4D NCHW)，ORT tensor 直接
+//                             綁在 Mat 的底層 buffer 上，推理完不用 copy。
+//
+//  呼叫方式：
+//      OnnxInferenceEngine engine("model.onnx");
+//      engine.run(float_img);                         // 跑一次
+//      const auto& fmaps = engine.output_mats();      // 可直接丟 YOLO 後處理
+//
+//  假設：
+//    - 模型為單一輸入，shape = (1, 3, H, W)，dtype = float32。
+//    - 輸出為任意數量的 4D tensor（batch=1），dtype = float32。
+//  若需要 int8 輸入或多輸入，請另行擴充。
+//
+class OnnxInferenceEngine {
+public:
+    /**
+     * @brief 載入 ONNX 模型並配置所有推理用 buffer。
+     *
+     * @param model_path        ONNX 檔案路徑
+     * @param configure_options 可選的設定 callback，會在 Session 建立前被呼叫，
+     *                          傳入一個可寫的 SessionOptions 讓呼叫端調整
+     *                          （例如 intra-op threads、graph optimization level）。
+     *                          傳空的 lambda 或不傳即使用 ORT 預設值。
+     *
+     * @note  Ort::SessionOptions 不可複製（RAII wrapper 包 C handle），因此
+     *        API 設計成「在 ctor 內就地建構並讓呼叫端 in-place 修改」的形式，
+     *        而不是「呼叫端建好再傳入」。
+     */
+    using ConfigureOptionsFn = std::function<void(Ort::SessionOptions&)>;
+
+    explicit OnnxInferenceEngine(const std::string& model_path,
+                                 ConfigureOptionsFn configure_options = {});
+
+    /**
+     * @brief 執行一次推理。
+     *
+     * @param input_img  HWC CV_32FC3 圖片，尺寸 = (in_h, in_w)。
+     *                   內部會做 HWC → NCHW 轉換寫入預先配置的 buffer。
+     */
+    void run(const cv::Mat& input_img);
+
+    // ── 輸出存取（ORT 推理後直接可讀，資料存在內部 cv::Mat buffer 裡）──
+
+    /// 所有輸出的 4D NCHW Mat（與模型輸出順序相同）。
+    /// 可直接當作 YOLOPostProcessor::process() 的 feature_maps 輸入。
+    const std::vector<cv::Mat>& output_mats() const { return outputs_; }
+
+    /// 指定 index 的輸出 Mat。
+    const cv::Mat& output_mat(size_t idx) const { return outputs_.at(idx); }
+
+    // ── 模型資訊 ──
+    int64_t in_c() const { return ch_; }
+    int64_t in_h() const { return in_h_; }
+    int64_t in_w() const { return in_w_; }
+    size_t  num_outputs() const { return outputs_.size(); }
+
+private:
+    // ── ORT 物件（順序重要：env 要比 session 先死）──
+    Ort::Env                          env_;
+    std::unique_ptr<Ort::Session>     session_;
+    Ort::AllocatorWithDefaultOptions  allocator_;
+
+    // ── I/O 名稱（string 所有權留在 allocated_strings_，vector<const char*> 給 ORT）──
+    std::vector<Ort::AllocatedStringPtr> allocated_strings_;
+    std::vector<const char*>             input_names_;
+    std::vector<const char*>             output_names_;
+
+    // ── 輸入 ──
+    int64_t            ch_   = 0;
+    int64_t            in_h_ = 0;
+    int64_t            in_w_ = 0;
+    std::vector<float> input_tensor_values_;              // NCHW float buffer
+    std::vector<int64_t> input_shape_;                    // {1, C, H, W}
+
+    // ── 輸出 ──
+    // 每個輸出一個 4D cv::Mat（float32），ORT tensor 綁在 Mat buffer 上。
+    std::vector<cv::Mat>              outputs_;
+    std::vector<std::vector<int64_t>> output_shapes_;     // 與 outputs_ 對應的 shape（int64 版本，給 ORT）
+
+    // ── helper ──
+    void initialize_model_info();
+    void hwc_to_nchw(const cv::Mat& src);
+};

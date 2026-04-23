@@ -51,29 +51,28 @@ constexpr float kF32ScaleB = 1.f/kStdB;
 
 void fix2float(const cv::Mat& data, int fix_point, cv::Mat& out)
 {
-    // 確保輸入是 8-bit 有號整數 (INT8)，這是 DPU 常見的輸出型別
-    CV_Assert(data.depth() == CV_8S);
-
     // 使用 double 計算 scale 以維持精度，避免 1 << fix_point 在大位數時溢位
     double scale = 1.0 / static_cast<double>(1 << fix_point);
 
-    // 直接完成：[int8] -> [乘上 scale] -> [轉成 float32]
-    // out is passed by reference from the caller to avoid repeated allocation.
-    // convertTo reuses the existing buffer as long as size and type remain unchanged.
-    data.convertTo(out, CV_32F, scale);
+    // 關鍵：rtype 要用 CV_MAKETYPE(depth, channels) 的完整形式，不能只給
+    // CV_32F。因為 CV_32F == CV_32FC1 == 5，如果 out 是被 Mat_<float>
+    // 約束成單通道的 header，convertTo 會把輸入 3-channel 資料「扁平化」
+    // 成 CV_32FC1 + cols*3，破壞下游對 channel 數的假設（例如 ONNX 推理
+    // 的 CV_32FC3 assert）。
+    //
+    // 明確給 CV_MAKETYPE(CV_32F, channels()) 會強制 out 保留 3-channel
+    // header，layout 語意跟 input 一致。
+    const int rtype = CV_MAKETYPE(CV_32F, data.channels());
+    data.convertTo(out, rtype, scale);
 }
 
 void float2fix(const cv::Mat& data, int fix_point, cv::Mat& out)
 {
-    // 改用 .depth() 檢查，這只會檢查資料型別(Float32)，不論通道數
-    CV_Assert(data.depth() == CV_32F);
-
     double scale = static_cast<double>(1 << fix_point);
 
-    // float → int8 (Q format)
-    // out is passed by reference from the caller to avoid repeated allocation.
-    // convertTo reuses the existing buffer as long as size and type remain unchanged.
-    data.convertTo(out, CV_8S, scale);
+    // 同 fix2float：用完整 type 保留 channel header
+    const int rtype = CV_MAKETYPE(CV_8S, data.channels());
+    data.convertTo(out, rtype, scale);
 }
 
 // ============================================================================
@@ -827,4 +826,175 @@ cv::Mat draw_boxes(const cv::Mat&                  img,
     }
 
     return out;
+}
+
+// ============================================================================
+//  OnnxInferenceEngine
+// ============================================================================
+//
+//  設計要點：
+//
+//  (1) 所有 buffer 在 ctor 配好，run() 完全不做 heap allocation。
+//      - input_tensor_values_ : N*C*H*W 個 float
+//      - outputs_             : 每個輸出對應一個 4D cv::Mat
+//
+//  (2) 輸出不 copy。ORT 的 Value::CreateTensor<float>(..., user_data, ...)
+//      會讓 ORT 把結果直接寫進我們提供的 buffer（也就是 cv::Mat 的 data）。
+//      推理結束後 outputs_[i] 即可直接使用。
+//
+//  (3) 輸出 shape 的動態維度（-1）被當作 1 處理，與原 onnx_test.cpp 一致；
+//      這對常見 YOLO 系列模型（固定 input → 固定 output）足夠。若有真正動態
+//      shape 需求，需要改為每次 Run 後讀 tensor_info 再重新包 cv::Mat。
+//
+//  (4) 名稱字串生命週期：GetInputNameAllocated 回傳的 AllocatedStringPtr
+//      擁有 char* 的所有權，我們把 ptr 存進 allocated_strings_、把 raw char*
+//      push 進 input_names_/output_names_，這樣 ORT Run 時指標仍有效。
+//
+
+OnnxInferenceEngine::OnnxInferenceEngine(const std::string& model_path,
+                                         ConfigureOptionsFn configure_options)
+    : env_(ORT_LOGGING_LEVEL_WARNING, "OnnxInferenceEngine")
+{
+    // SessionOptions 不可複製（RAII wrapper 包 C handle），所以在 ctor 內
+    // 就地建好、讓呼叫端透過 callback 修改、然後傳給 Session ctor。
+    // Session ctor 會把 options 的內容 copy 到 session 內部，之後 opts
+    // 可以安心被解構。
+    Ort::SessionOptions opts;
+    if (configure_options) {
+        configure_options(opts);
+    }
+
+    session_ = std::make_unique<Ort::Session>(env_, model_path.c_str(), opts);
+    initialize_model_info();
+}
+
+
+void OnnxInferenceEngine::initialize_model_info()
+{
+    // ── 輸入 ──
+    {
+        auto input_name_ptr = session_->GetInputNameAllocated(0, allocator_);
+        input_names_.push_back(input_name_ptr.get());
+        allocated_strings_.push_back(std::move(input_name_ptr));
+
+        auto in_shape = session_->GetInputTypeInfo(0)
+                                 .GetTensorTypeAndShapeInfo()
+                                 .GetShape();
+        if (in_shape.size() != 4) {
+            throw std::runtime_error("OnnxInferenceEngine: input must be 4D (NCHW).");
+        }
+        // NCHW；動態 batch 視為 1
+        ch_   = (in_shape[1] < 0) ? 3 : in_shape[1];
+        in_h_ = (in_shape[2] < 0) ? 1 : in_shape[2];
+        in_w_ = (in_shape[3] < 0) ? 1 : in_shape[3];
+
+        if (ch_ != 3) {
+            throw std::runtime_error(
+                "OnnxInferenceEngine: only 3-channel input is supported.");
+        }
+
+        input_shape_ = {1, ch_, in_h_, in_w_};
+        input_tensor_values_.assign(
+            static_cast<size_t>(ch_ * in_h_ * in_w_), 0.0f);
+    }
+
+    // ── 輸出 ──
+    const size_t num_outputs = session_->GetOutputCount();
+    outputs_.clear();
+    outputs_.reserve(num_outputs);
+    output_shapes_.clear();
+    output_shapes_.reserve(num_outputs);
+
+    for (size_t i = 0; i < num_outputs; ++i) {
+        auto out_name_ptr = session_->GetOutputNameAllocated(i, allocator_);
+        output_names_.push_back(out_name_ptr.get());
+        allocated_strings_.push_back(std::move(out_name_ptr));
+
+        auto out_shape = session_->GetOutputTypeInfo(i)
+                                  .GetTensorTypeAndShapeInfo()
+                                  .GetShape();
+        // 把動態維度 (-1) 視為 1
+        for (auto& d : out_shape) if (d < 0) d = 1;
+
+        if (out_shape.size() != 4) {
+            throw std::runtime_error(
+                "OnnxInferenceEngine: only 4D outputs are supported (got shape size "
+                + std::to_string(out_shape.size()) + ").");
+        }
+
+        // 用 cv::Mat 的 4D 建構：sizes = {N, C, H, W}
+        std::vector<int> sizes_int(out_shape.size());
+        for (size_t k = 0; k < out_shape.size(); ++k)
+            sizes_int[k] = static_cast<int>(out_shape[k]);
+
+        outputs_.emplace_back(static_cast<int>(sizes_int.size()),
+                              sizes_int.data(), CV_32F);
+        output_shapes_.push_back(std::move(out_shape));
+    }
+}
+
+
+void OnnxInferenceEngine::hwc_to_nchw(const cv::Mat& src)
+{
+    // src: CV_32FC3, 尺寸 (in_h_, in_w_)（由 run() 的 assert 保證）
+    // dst buffer 已經在 ctor 配好，這裡只是把 3 個通道 split 到連續的 plane
+    const int H = static_cast<int>(in_h_);
+    const int W = static_cast<int>(in_w_);
+    const size_t plane = static_cast<size_t>(H) * W;
+
+    std::vector<cv::Mat> ch_planes;
+    ch_planes.reserve(3);
+    for (int c = 0; c < 3; ++c) {
+        ch_planes.emplace_back(H, W, CV_32FC1,
+                               input_tensor_values_.data() + c * plane);
+    }
+    cv::split(src, ch_planes);
+}
+
+
+void OnnxInferenceEngine::run(const cv::Mat& input_img)
+{
+    // ── 防呆：型別與尺寸 ──
+    //
+    // 要求嚴格的 CV_32FC3 + (in_h_, in_w_)。前處理端（fix2float）現在會
+    // 保留 3-channel header，所以這個 assert 能通過。若你之後又看到這個
+    // assert 爆掉，第一嫌疑仍是「有人用 cv::Mat_<float> 當 convertTo 的
+    // 輸出」——Mat_<T> 會強制單通道 reshape，請改回 cv::Mat。
+    CV_Assert(input_img.type() == CV_32FC3);
+    CV_Assert(input_img.cols == in_w_ && input_img.rows == in_h_);
+
+    // ── HWC → NCHW ──
+    hwc_to_nchw(input_img);
+
+    // ── 建立 ORT Value：輸入 ──
+    Ort::MemoryInfo memory_info =
+        Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+    std::vector<Ort::Value> input_tensors;
+    input_tensors.reserve(1);
+    input_tensors.push_back(Ort::Value::CreateTensor<float>(
+        memory_info,
+        input_tensor_values_.data(),
+        input_tensor_values_.size(),
+        input_shape_.data(),
+        input_shape_.size()));
+
+    // ── 建立 ORT Value：輸出（綁到預配置的 cv::Mat buffer）──
+    std::vector<Ort::Value> output_tensors;
+    output_tensors.reserve(outputs_.size());
+    for (size_t i = 0; i < outputs_.size(); ++i) {
+        cv::Mat& m = outputs_[i];
+        const size_t n_elem = static_cast<size_t>(m.total());
+        output_tensors.push_back(Ort::Value::CreateTensor<float>(
+            memory_info,
+            m.ptr<float>(),         // ORT 會直接寫入這塊記憶體
+            n_elem,
+            output_shapes_[i].data(),
+            output_shapes_[i].size()));
+    }
+
+    // ── Run ──
+    session_->Run(Ort::RunOptions{nullptr},
+                  input_names_.data(),  input_tensors.data(),  input_tensors.size(),
+                  output_names_.data(), output_tensors.data(), output_tensors.size());
 }
