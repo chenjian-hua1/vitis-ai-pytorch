@@ -49,30 +49,21 @@ constexpr float kF32ScaleB = 1.f/kStdB;
 //  Fix / Float Conversion
 // ============================================================================
 
+#include <cmath>
+
 void fix2float(const cv::Mat& data, int fix_point, cv::Mat& out)
 {
-    // 使用 double 計算 scale 以維持精度，避免 1 << fix_point 在大位數時溢位
-    double scale = 1.0 / static_cast<double>(1 << fix_point);
-
-    // 關鍵：rtype 要用 CV_MAKETYPE(depth, channels) 的完整形式，不能只給
-    // CV_32F。因為 CV_32F == CV_32FC1 == 5，如果 out 是被 Mat_<float>
-    // 約束成單通道的 header，convertTo 會把輸入 3-channel 資料「扁平化」
-    // 成 CV_32FC1 + cols*3，破壞下游對 channel 數的假設（例如 ONNX 推理
-    // 的 CV_32FC3 assert）。
-    //
-    // 明確給 CV_MAKETYPE(CV_32F, channels()) 會強制 out 保留 3-channel
-    // header，layout 語意跟 input 一致。
-    const int rtype = CV_MAKETYPE(CV_32F, data.channels());
-    data.convertTo(out, rtype, scale);
+    // std::exp2f(-fix_point) 直接算出 2^(-fix_point)
+    // 既安全，編譯器也能在編譯期高度最佳化
+    float scale = std::exp2f(-static_cast<float>(fix_point));
+    data.convertTo(out, CV_32FC3, scale);
 }
 
 void float2fix(const cv::Mat& data, int fix_point, cv::Mat& out)
 {
-    double scale = static_cast<double>(1 << fix_point);
-
-    // 同 fix2float：用完整 type 保留 channel header
-    const int rtype = CV_MAKETYPE(CV_8S, data.channels());
-    data.convertTo(out, rtype, scale);
+    // std::exp2f(fix_point) 直接算出 2^(fix_point)
+    float scale = std::exp2f(static_cast<float>(fix_point));
+    data.convertTo(out, CV_8SC3, scale);
 }
 
 // ============================================================================
