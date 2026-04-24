@@ -30,7 +30,7 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    const int ITER   = 100;
+    const int ITER   = 1000;
     const int WARMUP = 10;
 
     // conf / iou 集中在這裡，decode 跟 nms 必須用相同 conf

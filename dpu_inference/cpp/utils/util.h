@@ -7,7 +7,9 @@
 #include <functional>
 
 #include <opencv2/opencv.hpp>
-#include <onnxruntime_cxx_api.h>
+
+// #define ONNX_MODE
+#define XMODEL_MODE
 
 // ============================================================================
 //  Data Structures
@@ -306,6 +308,11 @@ cv::Mat draw_boxes(const cv::Mat&                    img,
                    const std::vector<std::string>&   class_names = {});
 
 
+
+#ifdef ONNX_MODE
+
+#include <onnxruntime_cxx_api.h>
+
 // ============================================================================
 //  ONNX Runtime Inference Engine
 // ============================================================================
@@ -395,3 +402,67 @@ private:
     void initialize_model_info();
     void hwc_to_nchw(const cv::Mat& src);
 };
+
+#endif
+
+
+#ifdef XMODEL_MODE
+
+// 加上這兩行！告訴編譯器 xir 和 vart 是命名空間，裡面有這些 class
+namespace xir  { class Graph; class Attrs; class Tensor; }
+namespace vart { class RunnerExt; class TensorBuffer; }
+
+class XmodelInferenceEngine {
+public:
+    explicit XmodelInferenceEngine(const std::string& xmodel_path);
+    ~XmodelInferenceEngine();
+
+    XmodelInferenceEngine(const XmodelInferenceEngine&)            = delete;
+    XmodelInferenceEngine& operator=(const XmodelInferenceEngine&) = delete;
+
+    // ── 綁定 API ──
+    void bind_input_mat(cv::Mat& ext_input) const { ext_input = input_mat_; }
+
+    /**
+     * @brief 取得預先建好的 NCHW 排列 int8 輸出。
+     * DPU 內部為 NHWC，引擎會在 run() 結束時自動排版至此 Mat 中。
+     */
+    const cv::Mat& output_mat_nchw(size_t idx) const { return outputs_nchw_.at(idx); }
+
+    // ── 執行 ──
+    /**
+     * @brief 執行推理。
+     * 呼叫前，請確保已透過綁定的 cv::Mat 寫入量化後的資料 (CV_8SC3)。
+     * 內部純粹執行 DPU sync 與 wait，無任何拷貝。
+     */
+    void run();
+
+    // ── 模型資訊 ──
+    int    in_c() const { return in_c_; }
+    int    in_h() const { return in_h_; }
+    int    in_w() const { return in_w_; }
+    size_t num_outputs() const { return outputs_.size(); }
+    float  input_scale() const { return input_scale_; }
+    float  output_scale(size_t i) const { return output_scales_.at(i); }
+
+private:
+    std::unique_ptr<xir::Graph>       graph_;
+    std::unique_ptr<xir::Attrs>       attrs_;
+    std::unique_ptr<vart::RunnerExt>  runner_;
+
+    std::vector<vart::TensorBuffer*>  input_tensor_buffers_;
+    std::vector<vart::TensorBuffer*>  output_tensor_buffers_;
+
+    int   in_c_ = 0, in_h_ = 0, in_w_ = 0;
+    float input_scale_ = 1.0f;
+
+    // 預建好的 DPU 記憶體替身
+    cv::Mat               input_mat_;      
+    std::vector<cv::Mat>  outputs_;        // DPU 實體記憶體替身 (NHWC)
+    std::vector<cv::Mat>  outputs_nchw_;   // [新增] 預建好的 NCHW int8 緩衝區
+    std::vector<float>    output_scales_;
+
+    void initialize_model_info(const std::string& xmodel_path);
+};
+
+#endif

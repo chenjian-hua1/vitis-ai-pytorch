@@ -828,6 +828,9 @@ cv::Mat draw_boxes(const cv::Mat&                  img,
     return out;
 }
 
+
+#ifdef ONNX_MODE
+
 // ============================================================================
 //  OnnxInferenceEngine
 // ============================================================================
@@ -998,3 +1001,178 @@ void OnnxInferenceEngine::run(const cv::Mat& input_img)
                   input_names_.data(),  input_tensors.data(),  input_tensors.size(),
                   output_names_.data(), output_tensors.data(), output_tensors.size());
 }
+
+#endif
+
+ 
+#ifdef XMODEL_MODE
+
+// ============================================================================
+//  XmodelInferenceEngine 實作
+//
+//  連結需求（典型最小集合）:
+//      -lvart-runner -lxir -lglog
+//  若 link error 抱怨缺 symbol，依訊息補:
+//      -lvart-util -lunilog ...
+// ============================================================================
+
+// 加上這些 VART / XIR 的標頭檔！
+#include <xir/graph/graph.hpp>
+#include <xir/attrs/attrs.hpp>
+#include <xir/tensor/tensor.hpp>
+#include <vart/runner.hpp>
+#include <vart/runner_ext.hpp>
+#include <vart/tensor_buffer.hpp>
+
+// ── 匿名 helper：從 XIR Tensor 抓取 fix_point 並轉為 scale ──
+namespace {
+
+// input  scale = 2^(+fix_point)
+inline float get_input_scale(const xir::Tensor* t) {
+    int fp = t->template get_attr<int>("fix_point");
+    return std::exp2f(static_cast<float>(fp));
+}
+
+// output scale = 2^(-fix_point)
+inline float get_output_scale(const xir::Tensor* t) {
+    int fp = t->template get_attr<int>("fix_point");
+    return std::exp2f(-static_cast<float>(fp));
+}
+
+} // namespace
+
+// ── 建構子 / 解構子 ─────────────────────────────────────────────────────────
+
+XmodelInferenceEngine::XmodelInferenceEngine(const std::string& xmodel_path)
+{
+    // 建構時直接呼叫初始化函數
+    initialize_model_info(xmodel_path);
+}
+
+// 解構子必須在 .cpp 中定義，因為 std::unique_ptr 需要知道 xir/vart 類別的完整大小才能釋放
+XmodelInferenceEngine::~XmodelInferenceEngine() = default;
+
+
+// ── 實作區 ─────────────────────────────────────────────────────────────────
+
+void XmodelInferenceEngine::initialize_model_info(const std::string& xmodel_path)
+{
+    // 1. Deserialize xmodel & 挑出 DPU subgraph
+    graph_ = xir::Graph::deserialize(xmodel_path);
+    const auto* root = graph_->get_root_subgraph();
+ 
+    // 👇 這裡加上 const！
+    const xir::Subgraph* dpu_subgraph = nullptr; 
+    
+    for (auto* c : root->children_topological_sort()) {
+        if (c->has_attr("device") && c->get_attr<std::string>("device") == "DPU") {
+            dpu_subgraph = c;
+            break;
+        }
+    }
+    
+    if (!dpu_subgraph) {
+        throw std::runtime_error("XmodelInferenceEngine: no DPU subgraph found in " + xmodel_path);
+    }
+ 
+    // 2. 建 runner
+    attrs_  = xir::Attrs::create();
+    runner_ = vart::RunnerExt::create_runner(dpu_subgraph, attrs_.get());
+ 
+    // 3. 抓 input / output tensor buffers
+    input_tensor_buffers_  = runner_->get_inputs();
+    output_tensor_buffers_ = runner_->get_outputs();
+
+    // 4. Input meta & 建立輸入替身 (input_mat_)
+    {
+        const auto* in_t  = input_tensor_buffers_[0]->get_tensor();
+        const auto  shape = in_t->get_shape();
+        in_h_ = shape[1];
+        in_w_ = shape[2];
+        in_c_ = shape[3];
+        input_scale_ = get_input_scale(in_t);
+
+        // 取得 DPU Input Buffer 實體位址並封裝成 cv::Mat
+        uint64_t data_addr = 0u;
+        size_t   size_bytes = 0u;
+        std::tie(data_addr, size_bytes) = input_tensor_buffers_[0]->data({0, 0, 0, 0});
+        
+        input_mat_ = cv::Mat(in_h_, in_w_, CV_8SC3, reinterpret_cast<void*>(data_addr));
+    }
+
+    // 5. Output meta & 建立輸出替身
+    const size_t num_outs = output_tensor_buffers_.size();
+    outputs_.clear();        outputs_.reserve(num_outs);
+    outputs_nchw_.clear();   outputs_nchw_.reserve(num_outs); // 新增
+    output_scales_.clear();  output_scales_.reserve(num_outs);
+ 
+    for (size_t i = 0; i < num_outs; ++i) {
+        const auto* out_t = output_tensor_buffers_[i]->get_tensor();
+        const auto  shape = out_t->get_shape();
+        output_scales_.push_back(get_output_scale(out_t));
+ 
+        // DPU 原生的 NHWC shape
+        std::vector<int> sizes_int(shape.size());
+        for (size_t k = 0; k < shape.size(); ++k) sizes_int[k] = static_cast<int>(shape[k]);
+ 
+        // 取得 DPU 實體位址並封裝成 cv::Mat (NHWC)
+        std::vector<int> idx(shape.size(), 0);
+        uint64_t data_addr = 0u; size_t size_bytes = 0u;
+        std::tie(data_addr, size_bytes) = output_tensor_buffers_[i]->data(idx);
+        
+        outputs_.emplace_back(static_cast<int>(sizes_int.size()),
+                              sizes_int.data(), CV_8S, reinterpret_cast<void*>(data_addr));
+
+        // 🔥 [新增] 預先配置一塊獨立的 CPU 記憶體，用來放 NCHW 的 int8 資料
+        int C = sizes_int[sizes_int.size() - 1];
+        int W = sizes_int[sizes_int.size() - 2];
+        int H = sizes_int[sizes_int.size() - 3];
+        int sizes_nchw[] = {1, C, H, W};
+        outputs_nchw_.emplace_back(4, sizes_nchw, CV_8S); 
+    }
+}
+
+// ── 執行推理：極簡化，只做 sync 與 execute ─────────────────────────────────
+void XmodelInferenceEngine::run()
+{
+    // 1. flush cache
+    for (auto* inp : input_tensor_buffers_) {
+        const auto* t = inp->get_tensor();
+        inp->sync_for_write(0, t->get_data_size() / t->get_shape()[0]);
+    }
+ 
+    // 2. 跑 DPU
+    auto v = runner_->execute_async(input_tensor_buffers_, output_tensor_buffers_);
+    const int status = runner_->wait(static_cast<int>(v.first), -1);
+    // ... 錯誤檢查 ...
+ 
+    // 3. invalidate cache (讓 CPU 讀到最新 DPU 結果)
+    for (auto* out : output_tensor_buffers_) {
+        const auto* t = out->get_tensor();
+        out->sync_for_read(0, t->get_data_size() / t->get_shape()[0]);
+    }
+
+    // 4. 🔥 [新增] 把 DPU 的 NHWC int8 資料，搬移到預建的 NCHW int8 替身中
+    for (size_t i = 0; i < output_tensor_buffers_.size(); ++i) {
+        const cv::Mat& nhwc_mat = outputs_[i];
+        cv::Mat&       nchw_mat = outputs_nchw_[i];
+
+        int ndims = nhwc_mat.dims;
+        int H = nhwc_mat.size[ndims - 3];
+        int W = nhwc_mat.size[ndims - 2];
+        int C = nhwc_mat.size[ndims - 1];
+
+        const int8_t* src = nhwc_mat.ptr<int8_t>();
+        int8_t* dst = nchw_mat.ptr<int8_t>();
+
+        for (int h = 0; h < H; ++h) {
+            for (int w = 0; w < W; ++w) {
+                for (int c = 0; c < C; ++c) {
+                    dst[c * H * W + h * W + w] = src[h * W * C + w * C + c];
+                }
+            }
+        }
+    }
+}
+
+#endif
