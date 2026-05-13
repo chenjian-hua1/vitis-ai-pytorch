@@ -9,7 +9,9 @@
 #include <opencv2/opencv.hpp>
 
 // #define ONNX_MODE
-#define XMODEL_MODE
+#ifndef XMODEL_MODE
+#define ONNX_MODE
+#endif
 
 // ============================================================================
 //  Data Structures
