@@ -18,3 +18,4 @@ train/weights/*
 test file/quantize_result/*
 dpu_inference/cpp/cpu_sim/detection_result.jpg
 dpu_inference/cpp/dpu_run/detection_result.jpg
+dpu_inference/model/yolo_kv26 copy.xmodel
