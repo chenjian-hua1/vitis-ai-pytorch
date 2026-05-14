@@ -386,8 +386,12 @@ void YOLOPostProcessor::classify_and_build_mask(float conf_thresh)
         // class logit，這 nc 個值在記憶體中完全連續。inner max-reduction
         // loop 為 sequential read，編譯器可向量化。
         for (int a = 0; a < A; ++a) {
+            // achor_base_addr = achor_idx*no (ch*4+nc)
+            // achor_cls_base_addr = achor_base_addr + ch*4
+            // scan nc times cls logit [achor_cls_base_addr:achor_cls_base_addr+nc]
             const float* RESTRICT cls = xcat + static_cast<size_t>(a) * no_ + CLS_OFFSET;
 
+            // max(cls[0:nc])
             float max_l  = cls[0];
             int   max_id = 0;
             for (int c = 1; c < nc_; ++c) {
@@ -395,8 +399,10 @@ void YOLOPostProcessor::classify_and_build_mask(float conf_thresh)
                 if (v > max_l) { max_l = v; max_id = c; }
             }
 
+            // max_logit < conf  →  jump calculate sigmoid prob 
             if (max_l <= logit_thresh) continue;
 
+            // calculate cls prob (sigmoid)
             active_indices_[b].push_back(a);
             float max_s = 1.f / (1.f + expf(-max_l));
             active_max_score_[b].push_back(max_s);
