@@ -109,23 +109,23 @@ void benchmark(
     // 7. 後處理計時 (反量化 -> Decode -> NMS)
     double t_f2f_back = 0, t_post = 0, t_nms = 0;
 
-    for (int i = 0; i < iter; ++i) {
-        double t0 = time_now();
-        for (size_t out_idx = 0; out_idx < engine.num_outputs(); ++out_idx) {
-            fix2float(engine.output_mat_nchw(out_idx), out_fix_points[out_idx], float_outputs[out_idx]);
-        }
-        t_f2f_back += time_now() - t0;
-    }
+    // for (int i = 0; i < iter; ++i) {
+    //     double t0 = time_now();
+    //     for (size_t out_idx = 0; out_idx < engine.num_outputs(); ++out_idx) {
+    //         fix2float(engine.output_mat_nchw(out_idx), out_fix_points[out_idx], float_outputs[out_idx]);
+    //     }
+    //     t_f2f_back += time_now() - t0;
+    // }
 
-    for (int i = 0; i < iter; ++i) {
-        double t0 = time_now();
-        yolo_pp.decode(float_outputs, conf_th);
-        t_post += time_now() - t0;
+    // for (int i = 0; i < iter; ++i) {
+    //     double t0 = time_now();
+    //     yolo_pp.decode(float_outputs, conf_th);
+    //     t_post += time_now() - t0;
 
-        t0 = time_now();
-        yolo_pp.nms(conf_th, iou_th);
-        t_nms += time_now() - t0;
-    }
+    //     t0 = time_now();
+    //     yolo_pp.nms(conf_th, iou_th);
+    //     t_nms += time_now() - t0;
+    // }
 
     // 8. 輸出結果
     std::cout << std::fixed << std::setprecision(3);
@@ -304,17 +304,20 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
         const bool save_video = !out_file.empty();
         cv::VideoWriter writer;
         if (save_video) {
-            // writer.open(out_file,
-            //             cv::VideoWriter::fourcc('m','p','4','v'),
-            //             src_fps,
-            //             cv::Size(src_w, src_h));
+            std::ostringstream pipe;
+            pipe << "appsrc ! videoconvert ! video/x-raw,format=NV12 ! "
+                << "omxh264enc target-bitrate=4000 control-rate=2 gop-length=30 ! "
+                << "video/x-h264,profile=main ! "
+                << "h264parse ! mp4mux ! "
+                << "filesink location=" << out_file;
 
-            // 改成
-            std::string avi_out = std::filesystem::path(out_file).replace_extension(".avi").string();
-            writer.open(avi_out,
-                        cv::VideoWriter::fourcc('M','J','P','G'),
+            writer.open(pipe.str(),
+                        cv::CAP_GSTREAMER,
+                        0,
                         src_fps,
-                        cv::Size(src_w, src_h));
+                        cv::Size(src_w, src_h),
+                        true);
+
             if (!writer.isOpened()) {
                 std::cerr << "Failed to open VideoWriter: " << out_file
                           << "  (將不寫出影片繼續執行)\n";
@@ -427,7 +430,15 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
     else if (ext == "mp4" || ext == "avi" || ext == "mov" || ext == "mkv" ||
              ext == "flv" || ext == "wmv" || ext == "webm" || ext == "m4v")
     {
-        cv::VideoCapture cap(video_path);
+        // cv::VideoCapture cap(video_path);
+
+        std::ostringstream pipe;
+        pipe << "filesrc location=" << video_path << " ! "
+            << "qtdemux ! h264parse ! omxh264dec ! "
+            << "video/x-raw,format=NV12 ! "
+            << "appsink drop=true sync=false max-buffers=1";
+
+        cv::VideoCapture cap(pipe.str(), cv::CAP_GSTREAMER);
         if (!cap.isOpened()) {
             std::cerr << "Failed to open video: " << video_path << "\n";
             return;
@@ -444,28 +455,47 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
                   << "  frames=" << (int)cap.get(cv::CAP_PROP_FRAME_COUNT) << "\n";
 
         // ===== 影片寫出器（僅在 out_file 非空時建立）=====
-        const bool save_video = !out_file.empty();
+        // const bool save_video = !out_file.empty();
+        const bool save_video = false;
         cv::VideoWriter writer;
         if (save_video) {
-            writer.open(out_file,
-                        cv::VideoWriter::fourcc('m','p','4','v'),
+            // writer.open(out_file,
+            //             cv::VideoWriter::fourcc('H','2','6','4'),  // 或 'H','2','6','4'
+            //             src_fps,
+            //             cv::Size(src_w, src_h));
+
+            std::ostringstream pipe;
+            pipe << "appsrc ! videoconvert ! video/x-raw,format=NV12 ! "
+                << "omxh264enc target-bitrate=4000 control-rate=2 gop-length=30 ! "
+                << "video/x-h264,profile=main ! "
+                << "h264parse ! mp4mux ! "
+                << "filesink location=" << out_file;
+
+            writer.open(pipe.str(),
+                        cv::CAP_GSTREAMER,
+                        0,
                         src_fps,
-                        cv::Size(src_w, src_h));
+                        cv::Size(src_w, src_h),
+                        true);
+
             if (!writer.isOpened()) {
                 std::cerr << "Failed to open VideoWriter: " << out_file
                           << "  (將不寫出影片繼續執行)\n";
             }
         }
 
-        cv::Mat frame;
+        cv::Mat frame, raw_nv12;
         int frame_idx = 0;
         double t_start = time_now();
         double t_prev  = t_start;
         int    prev_idx = 0;
         double inst_fps = 0.0;
 
-        while (cap.read(frame)) {
-            if (frame.empty()) break;
+        // while (cap.read(frame)) {
+        //     if (frame.empty()) break;
+        while (cap.read(raw_nv12)) {
+            if (raw_nv12.empty()) break;
+            cv::cvtColor(raw_nv12, frame, cv::COLOR_YUV2BGR_NV12);
 
             resize(frame, in_w, resize_result);
             norm(resize_result.img, norm_img);
@@ -579,14 +609,14 @@ int main(int argc, char** argv) {
     const float CONF = 0.1f;
     const float IOU  = 0.45f;
 
-    // cv::Mat img = cv::imread(src);
-    // if (img.empty()) {
-    //     std::cerr << "無法開啟檔案: " << src << "\n";
-    //     return -1;
-    // }
-    // benchmark(model_path, img, 10, 1000, CONF, IOU);
+    cv::Mat img = cv::imread(src);
+    if (img.empty()) {
+        std::cerr << "無法開啟檔案: " << src << "\n";
+        return -1;
+    }
+    benchmark(model_path, img, 10, 1000, CONF, IOU);
 
-    run_video(model_path, src, "pred.avi", CONF, IOU);
+    // run_video(model_path, src, "~/pred.mp4", CONF, IOU);
 
     return 0;
 }
