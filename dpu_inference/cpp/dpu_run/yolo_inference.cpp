@@ -20,26 +20,6 @@ double time_now() {
         Clock::now().time_since_epoch()).count();
 }
 
-// ============================================================================
-//  Helper：把 DPU 的 NHWC int8 output 反量化為 NHWC float32
-// ============================================================================
-//
-//  為什麼不用 fix2float()：
-//    fix2float() 內部呼叫 convertTo(out, CV_32FC3, scale)，type 帶有 "C3"
-//    這對 (H, W, 3) 的 3D image 是對的（前處理）。但 DPU output 是 4D
-//    (1, H, W, no_)，no_ != 3。OpenCV 對 dims>2 的 Mat 會忽略 type 裡的
-//    channel 部分（只取 depth），實務上能跑，但語意不一致。這裡顯式用
-//    convertTo(..., CV_32F, scale) 表達「只改 depth、不動 shape/channel」。
-//
-//  輸入: DPU NHWC int8 Mat，shape = (1, H, W, no_)
-//  輸出: NHWC float32 Mat，shape 與 channel 完全相同
-//
-static inline void dequant_nhwc(const cv::Mat& src, int fix_point, cv::Mat& dst)
-{
-    const float scale = std::exp2f(-static_cast<float>(fix_point));
-    src.convertTo(dst, CV_32F, scale);
-}
-
 
 // ============================================================================
 //  Benchmark
@@ -52,7 +32,6 @@ void benchmark(
 {
     std::cout << "===== YOLO DPU (Xmodel) 推理效能測試 (平均 " << iter << " 次) =====\n";
 
-    // 1. 初始化 Xmodel 引擎
     XmodelInferenceEngine engine(xmodel_path);
 
     const int in_w = static_cast<int>(engine.in_w());
@@ -60,14 +39,9 @@ void benchmark(
     std::cout << "模型輸入: " << in_w << "x" << in_h
               << "  輸出數量: " << engine.num_outputs() << "\n";
 
-    // 2. 根據模型輸出決定後處理參數 (NHWC: shape = (1, H, W, no_))
+    // 讀取 NCHW 替身的 shape：(1, no_, H, W)，no_ 在 size[1]
     const int ch = 16;
-    const cv::Mat& out0 = engine.output_mat(0);
-    if (out0.dims != 4) {
-        std::cerr << "Xmodel output 不是 4D，無法判斷 layout (dims=" << out0.dims << ")\n";
-        return;
-    }
-    const int no = out0.size[3];   // ⭐ NHWC: channel 是最後一維
+    const int no = engine.output_mat_nchw(0).size[1];
     const int nc = no - 4 * ch;
 
     if (nc <= 0) {
@@ -75,11 +49,10 @@ void benchmark(
                   << ") 與 YOLO DFL 頭假設不符 (ch=" << ch << ")\n";
         return;
     }
-    std::cout << "推導出的 nc = " << nc << " (no=" << no << ", ch=" << ch << ")\n";
+    std::cout << "推導出的 nc = " << nc << "\n";
 
     YOLOPostProcessor yolo_pp(1, in_h, in_w, nc, ch);
 
-    // 3. 準備 Buffer 與 DPU Zero-copy 綁定
     ResizeResult resize_result;
     cv::Mat norm_img;
     std::vector<cv::Mat> float_outputs(engine.num_outputs());
@@ -88,33 +61,31 @@ void benchmark(
     cv::Mat dpu_input;
     engine.bind_input_mat(dpu_input);
 
-    // 計算 fix point
     int in_fix_point = static_cast<int>(std::round(std::log2(engine.input_scale())));
     std::vector<int> out_fix_points(engine.num_outputs());
     for (size_t i = 0; i < engine.num_outputs(); ++i) {
         out_fix_points[i] = static_cast<int>(std::round(-std::log2(engine.output_scale(i))));
     }
 
-    // 4. warmup
+    // warmup
     for (int i = 0; i < warmup; ++i) {
         resize(img, in_w, resize_result);
         norm(resize_result.img, norm_img);
 
-        float2fix(norm_img, in_fix_point, dpu_input);  // Zero-copy 寫入 DPU 實體記憶體
-        engine.run();                                  // 輸出直接是 NHWC int8
+        float2fix(norm_img, in_fix_point, dpu_input);
+        engine.run();  // 內部已做 NHWC → NCHW 轉置
 
-        // 反量化：NHWC int8 → NHWC float32 (layout 完全不變)
         for (size_t out_idx = 0; out_idx < engine.num_outputs(); ++out_idx) {
-            dequant_nhwc(engine.output_mat(out_idx),
-                         out_fix_points[out_idx],
-                         float_outputs[out_idx]);
+            fix2float(engine.output_mat_nchw(out_idx),
+                      out_fix_points[out_idx],
+                      float_outputs[out_idx]);
         }
 
         nms_result = &yolo_pp.process(float_outputs, conf_th, iou_th);
     }
     std::cout << "warmup 後偵測到 " << (*nms_result)[0].count << " 個框\n\n";
 
-    // 5. 前處理計時
+    // 前處理計時
     double t_resize = 0, t_norm = 0, t_f2f = 0;
     for (int i = 0; i < iter; ++i) {
         double t0 = time_now();
@@ -130,7 +101,7 @@ void benchmark(
         t_f2f += time_now() - t0;
     }
 
-    // 6. 推理計時
+    // 推理計時
     double t_infer = 0;
     for (int i = 0; i < iter; ++i) {
         double t0 = time_now();
@@ -138,15 +109,15 @@ void benchmark(
         t_infer += time_now() - t0;
     }
 
-    // 7. 後處理計時 (反量化 -> Decode -> NMS)
+    // 後處理計時
     double t_f2f_back = 0, t_post = 0, t_nms = 0;
 
     for (int i = 0; i < iter; ++i) {
         double t0 = time_now();
         for (size_t out_idx = 0; out_idx < engine.num_outputs(); ++out_idx) {
-            dequant_nhwc(engine.output_mat(out_idx),
-                         out_fix_points[out_idx],
-                         float_outputs[out_idx]);
+            fix2float(engine.output_mat_nchw(out_idx),
+                      out_fix_points[out_idx],
+                      float_outputs[out_idx]);
         }
         t_f2f_back += time_now() - t0;
     }
@@ -161,33 +132,30 @@ void benchmark(
         t_nms += time_now() - t0;
     }
 
-    // 8. 輸出結果
     std::cout << std::fixed << std::setprecision(3);
 
     std::cout << "===== 前處理 =====\n";
     std::cout << "Resize avg      : " << t_resize / iter << " ms\n";
     std::cout << "Norm avg        : " << t_norm / iter   << " ms\n";
     std::cout << "Float2Fix avg   : " << t_f2f / iter    << " ms (Zero-copy)\n";
-
     double preprocess = (t_resize + t_norm + t_f2f) / iter;
     std::cout << "Total preprocess: " << preprocess << " ms\n";
 
     std::cout << "\n===== 推理 =====\n";
     double infer = t_infer / iter;
-    std::cout << "DPU inference   : " << infer << " ms\n";
+    std::cout << "DPU inference   : " << infer << " ms (含 NHWC→NCHW 轉置)\n";
 
     std::cout << "\n===== 後處理 =====\n";
     std::cout << "Fix2Float avg   : " << t_f2f_back / iter << " ms (Dequantize)\n";
     std::cout << "YOLO decode avg : " << t_post / iter     << " ms\n";
     std::cout << "NMS avg         : " << t_nms / iter      << " ms\n";
-
     double postprocess = (t_f2f_back + t_post + t_nms) / iter;
     std::cout << "Total postprocess: " << postprocess << " ms\n";
 
     std::cout << "\n===== 總計 =====\n";
     std::cout << "Total pipeline  : " << preprocess + infer + postprocess << " ms\n";
 
-    // 9. 繪圖
+    // 繪圖
     const DetectionBatch& last = (*nms_result)[0];
     std::cout << "\n===== 繪圖 =====\n";
     std::cout << "偵測到 " << last.count << " 個框\n";
@@ -232,7 +200,6 @@ void benchmark(
 
 void run_video(std::string xmodel_path, std::string video_path, std::string out_file = "",
                double conf_th = 0.1, double iou_th = 0.45) {
-    // 1. 初始化 Xmodel 引擎
     XmodelInferenceEngine engine(xmodel_path);
 
     const int in_w = static_cast<int>(engine.in_w());
@@ -240,14 +207,8 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
     std::cout << "模型輸入: " << in_w << "x" << in_h
               << "  輸出數量: " << engine.num_outputs() << "\n";
 
-    // 2. 根據模型輸出決定後處理參數 (NHWC: shape = (1, H, W, no_))
     const int ch = 16;
-    const cv::Mat& out0 = engine.output_mat(0);
-    if (out0.dims != 4) {
-        std::cerr << "Xmodel output 不是 4D，無法判斷 layout (dims=" << out0.dims << ")\n";
-        return;
-    }
-    const int no = out0.size[3];   // ⭐ NHWC: channel 是最後一維
+    const int no = engine.output_mat_nchw(0).size[1];
     const int nc = no - 4 * ch;
 
     if (nc <= 0) {
@@ -255,11 +216,10 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
                   << ") 與 YOLO DFL 頭假設不符 (ch=" << ch << ")\n";
         return;
     }
-    std::cout << "推導出的 nc = " << nc << " (no=" << no << ", ch=" << ch << ")\n";
+    std::cout << "推導出的 nc = " << nc << "\n";
 
     YOLOPostProcessor yolo_pp(1, in_h, in_w, nc, ch);
 
-    // 3. 準備 Buffer 與 DPU Zero-copy 綁定
     ResizeResult resize_result;
     cv::Mat norm_img;
     std::vector<cv::Mat> float_outputs(engine.num_outputs());
@@ -274,7 +234,6 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
         out_fix_points[i] = static_cast<int>(std::round(-std::log2(engine.output_scale(i))));
     }
 
-    // ======================== 取小寫副檔名（不含點）===================================
     std::string ext = std::filesystem::path(video_path).extension().string();
     if (!ext.empty() && ext.front() == '.') ext.erase(0, 1);
     std::transform(ext.begin(), ext.end(), ext.begin(),
@@ -349,12 +308,8 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
                 << "h264parse ! mp4mux ! "
                 << "filesink location=" << out_file;
 
-            writer.open(pipe.str(),
-                        cv::CAP_GSTREAMER,
-                        0,
-                        src_fps,
-                        cv::Size(src_w, src_h),
-                        true);
+            writer.open(pipe.str(), cv::CAP_GSTREAMER, 0, src_fps,
+                        cv::Size(src_w, src_h), true);
 
             if (!writer.isOpened()) {
                 std::cerr << "Failed to open VideoWriter: " << out_file
@@ -387,9 +342,9 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
             engine.run();
 
             for (size_t out_idx = 0; out_idx < engine.num_outputs(); ++out_idx) {
-                dequant_nhwc(engine.output_mat(out_idx),
-                             out_fix_points[out_idx],
-                             float_outputs[out_idx]);
+                fix2float(engine.output_mat_nchw(out_idx),
+                          out_fix_points[out_idx],
+                          float_outputs[out_idx]);
             }
 
             nms_result = &yolo_pp.process(float_outputs, conf_th, iou_th);
@@ -421,9 +376,7 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
                     }
 
                     cv::Mat boxes_orig = scale_boxes(
-                        boxes_padded,
-                        resize_result.ratio,
-                        resize_result.pad,
+                        boxes_padded, resize_result.ratio, resize_result.pad,
                         cv::Size(frame.cols, frame.rows));
 
                     std::vector<Detection> dets_drawable(last.count);
@@ -450,9 +403,7 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
             }
         }
 
-        if (save_video && writer.isOpened()) {
-            writer.release();
-        }
+        if (save_video && writer.isOpened()) writer.release();
 
         double t_end    = time_now();
         double total_ms = t_end - t_start;
@@ -464,7 +415,7 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
             std::cout << "結果影片已存至: " << out_file << "\n";
         }
     }
-    // ======================== 一般影片 (mp4 / avi / mov ...) =========================
+    // ======================== 一般影片 =========================
     else if (ext == "mp4" || ext == "avi" || ext == "mov" || ext == "mkv" ||
              ext == "flv" || ext == "wmv" || ext == "webm" || ext == "m4v")
     {
@@ -490,7 +441,6 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
                   << "  fps=" << src_fps
                   << "  frames=" << (int)cap.get(cv::CAP_PROP_FRAME_COUNT) << "\n";
 
-        // ⭐ 改為跟著呼叫端的意圖：out_file 非空就嘗試寫出
         const bool save_video = !out_file.empty();
         cv::VideoWriter writer;
         if (save_video) {
@@ -501,12 +451,8 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
                 << "h264parse ! mp4mux ! "
                 << "filesink location=" << out_file;
 
-            writer.open(wpipe.str(),
-                        cv::CAP_GSTREAMER,
-                        0,
-                        src_fps,
-                        cv::Size(src_w, src_h),
-                        true);
+            writer.open(wpipe.str(), cv::CAP_GSTREAMER, 0, src_fps,
+                        cv::Size(src_w, src_h), true);
 
             if (!writer.isOpened()) {
                 std::cerr << "Failed to open VideoWriter: " << out_file
@@ -531,9 +477,9 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
             engine.run();
 
             for (size_t out_idx = 0; out_idx < engine.num_outputs(); ++out_idx) {
-                dequant_nhwc(engine.output_mat(out_idx),
-                             out_fix_points[out_idx],
-                             float_outputs[out_idx]);
+                fix2float(engine.output_mat_nchw(out_idx),
+                          out_fix_points[out_idx],
+                          float_outputs[out_idx]);
             }
 
             nms_result = &yolo_pp.process(float_outputs, conf_th, iou_th);
@@ -565,9 +511,7 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
                     }
 
                     cv::Mat boxes_orig = scale_boxes(
-                        boxes_padded,
-                        resize_result.ratio,
-                        resize_result.pad,
+                        boxes_padded, resize_result.ratio, resize_result.pad,
                         cv::Size(frame.cols, frame.rows));
 
                     std::vector<Detection> dets_drawable(last.count);
@@ -594,9 +538,7 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
             }
         }
 
-        if (save_video && writer.isOpened()) {
-            writer.release();
-        }
+        if (save_video && writer.isOpened()) writer.release();
 
         double t_end     = time_now();
         double total_ms  = t_end - t_start;
@@ -621,11 +563,11 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
 //  用法：
 //    ./prog [--task=benchmark|video]  <input_path>  <model_path>  [out_path]
 //
-//    --task 可放在 argv 任何位置；未指定時預設 benchmark（與原行為一致）。
-//    out_path 僅對 video 任務有意義；不給則不寫出。
+//    --task 可放在 argv 任何位置；未指定時預設 benchmark。
+//    out_path 僅 video 任務有意義；不給則不寫出。
 //
 //  範例：
-//    ./prog 2308.jpg model/YOLO_int.xmodel                       # benchmark (預設)
+//    ./prog 2308.jpg model/YOLO_int.xmodel
 //    ./prog --task=benchmark 2308.jpg model/YOLO_int.xmodel
 //    ./prog --task=video video.mp4 model/YOLO_int.xmodel
 //    ./prog --task=video video.mp4 model/YOLO_int.xmodel pred.mp4
@@ -637,7 +579,7 @@ struct CliArgs {
     Task        task = Task::Benchmark;
     std::string input_path;
     std::string model_path;
-    std::string out_path;   // 僅 video 用，空字串代表不寫出
+    std::string out_path;
 };
 
 static void print_usage(const char* prog) {
@@ -652,7 +594,6 @@ static void print_usage(const char* prog) {
 }
 
 static bool parse_args(int argc, char** argv, CliArgs& out) {
-    // 把 --task=... 從 argv 拆出來，剩下的當位置引數。
     std::vector<std::string> positional;
     positional.reserve(argc);
 
@@ -675,7 +616,6 @@ static bool parse_args(int argc, char** argv, CliArgs& out) {
         }
     }
 
-    // 位置引數：[0] input_path  [1] model_path  [2] out_path (optional)
     out.input_path = (positional.size() > 0)
         ? positional[0]
         : "/home/jianhua/Desktop/vitis-ai-pytorch/dpu_inference/2308.jpg";
