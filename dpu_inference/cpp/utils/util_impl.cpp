@@ -153,6 +153,34 @@ void norm(const cv::Mat& x, cv::Mat& out)
     }
 }
 
+void norm_and_fix(const cv::Mat& x, int fix_point, cv::Mat& out)
+{
+    CV_Assert(x.type() == CV_8UC3);
+
+    out.create(x.rows, x.cols, CV_8SC3);
+
+    const float fp_scale = std::exp2f(static_cast<float>(fix_point));
+
+    const float scaleR = kU8ScaleR * fp_scale;
+    const float scaleG = kU8ScaleG * fp_scale;
+    const float scaleB = kU8ScaleB * fp_scale;
+    const float biasR  = kU8BiasR  * fp_scale;
+    const float biasG  = kU8BiasG  * fp_scale;
+    const float biasB  = kU8BiasB  * fp_scale;
+
+    const uchar*  RESTRICT src = x.ptr<uchar>();
+    int8_t*       RESTRICT dst = out.ptr<int8_t>();
+
+    const int total = x.rows * x.cols;
+
+    #pragma omp simd
+    for (int i = 0; i < total; ++i) {
+        dst[3*i + 0] = static_cast<int8_t>(std::clamp(src[3*i + 0] * scaleR + biasR, -128.f, 127.f));
+        dst[3*i + 1] = static_cast<int8_t>(std::clamp(src[3*i + 1] * scaleG + biasG, -128.f, 127.f));
+        dst[3*i + 2] = static_cast<int8_t>(std::clamp(src[3*i + 2] * scaleB + biasB, -128.f, 127.f));
+    }
+}
+
 void resize(const cv::Mat& img, int input_size, ResizeResult& res)
 {
     const int orig_h = img.rows, orig_w = img.cols;
@@ -879,7 +907,7 @@ XmodelInferenceEngine::XmodelInferenceEngine(const std::string& xmodel_path)
 }
 
 XmodelInferenceEngine::~XmodelInferenceEngine() = default;
-
+dst
 
 void XmodelInferenceEngine::initialize_model_info(const std::string& xmodel_path)
 {
@@ -1021,72 +1049,57 @@ void XmodelInferenceEngine::run()
     }
 #endif
 
-    // 5. NHWC → NCHW int8 轉置(block-tiled)
-    //
-    // 為什麼用 tiled 而不是 naive 三重 loop:實機 benchmark (ARM Cortex-A,
-    // 80×80+40×40+20×20, C=144) 顯示:
-    //   naive triple-loop : 7.89 ms
-    //   tiled  (HW=16, C=32): 3.72 ms   (-53%)
-    // ARM 的 cache prefetcher 對 stride=C 的 naive 存取模式跟不上;tiled
-    // 版本把 src/dst 都切成 cache-line 對齊的小塊,prefetch 可預測,省時超過一半。
-    //
-    // 參數選擇:
-    //   HW_TILE = 16:一次處理 16 個 (h,w),src 跨度小到 prefetch 能 cover
-    //   C_TILE  = 32:dst 寫入是一整條 cache line (64 byte) 的一半,
-    //                 兩條 cache line 內塞 dst 與 src 的 prefetch 都 fit
-    //
-    constexpr int HW_TILE = 16;
-    constexpr int C_TILE  = 32;
-
+        // 5. NHWC → NCHW int8 轉置 (blocked + manual unroll×4, N=1)
     for (size_t i = 0; i < output_tensor_buffers_.size(); ++i) {
-        const cv::Mat& nhwc_mat = outputs_[i];
-        cv::Mat&       nchw_mat = outputs_nchw_[i];
-
-        int ndims = nhwc_mat.dims;
-        int H = nhwc_mat.size[ndims - 3];
-        int W = nhwc_mat.size[ndims - 2];
-        int C = nhwc_mat.size[ndims - 1];
+        const auto& nchw = outputs_nchw_[i];
+        const int C  = nchw.size[1];
+        const int H  = nchw.size[2];
+        const int W  = nchw.size[3];
         const int HW = H * W;
+        const int WC = W * C;   // == HW * C when H=1, kept for generality
 
-        // ★ 關鍵:src 指向不同的記憶體
-#if DPU_OUTPUT_CACHEABLE == 0
-        // Mode 0: 從 cacheable 暫存區讀(已 memcpy 過)
-        const int8_t* RESTRICT src = output_cache_buffers_[i].data();
-#else
-        // Mode 1: 直接從 DPU buffer 讀(硬體 coherency 確保 cache 內是最新)
-        const int8_t* RESTRICT src = nhwc_mat.ptr<int8_t>();
-#endif
-        int8_t* RESTRICT dst = nchw_mat.ptr<int8_t>();
+    #if DPU_OUTPUT_CACHEABLE == 0
+        const int8_t* __restrict__ src =
+            reinterpret_cast<const int8_t*>(output_cache_buffers_[i].data());
+    #else
+        const int8_t* __restrict__ src = outputs_[i].ptr<int8_t>();
+    #endif
+        int8_t* __restrict__ dst = outputs_nchw_[i].ptr<int8_t>();
 
-        int hw = 0;
-        for (; hw + HW_TILE <= HW; hw += HW_TILE) {
-            int c = 0;
-            for (; c + C_TILE <= C; c += C_TILE) {
-                // 處理一個 HW_TILE × C_TILE 的 tile
-                for (int dc = 0; dc < C_TILE; ++dc) {
-                    int8_t*       d = dst + (c + dc) * HW + hw;
-                    const int8_t* s = src + hw * C + c + dc;
-                    for (int dhw = 0; dhw < HW_TILE; ++dhw) {
-                        d[dhw] = s[dhw * C];
+        constexpr int BLOCK = 64;
+
+        #pragma omp parallel for schedule(static) collapse(2) \
+            if(static_cast<long>(C) * HW > 100000)
+        for (int c0 = 0; c0 < C; c0 += BLOCK) {
+            for (int hw0 = 0; hw0 < HW; hw0 += BLOCK) {
+                const int c_end  = std::min(c0  + BLOCK, C);
+                const int hw_end = std::min(hw0 + BLOCK, HW);
+
+                for (int c = c0; c < c_end; ++c) {
+                    // 計算數值的記憶體位置
+                    int8_t* __restrict__ dst_row = dst + c * HW;
+                    const int8_t* __restrict__ src_c = src + c; // NHWC: stride=C
+
+                    int hw = hw0;
+
+                    // unroll × 4
+                    // 只處理結尾到4的倍數
+                    const int hw_end4 = hw0 + ((hw_end - hw0) / 4) * 4;
+                    for (; hw < hw_end4; hw += 4) {
+                        dst_row[hw + 0] = src_c[(hw + 0) * C];
+                        dst_row[hw + 1] = src_c[(hw + 1) * C];
+                        dst_row[hw + 2] = src_c[(hw + 2) * C];
+                        dst_row[hw + 3] = src_c[(hw + 3) * C];
                     }
+
+                    // 處理4的餘數多出來尾端 scalar
+                    for (; hw < hw_end; ++hw)
+                        dst_row[hw] = src_c[hw * C];
                 }
-            }
-            // C 方向尾巴 (C % C_TILE)
-            for (; c < C; ++c) {
-                int8_t*       d = dst + c * HW + hw;
-                const int8_t* s = src + hw * C + c;
-                for (int dhw = 0; dhw < HW_TILE; ++dhw) {
-                    d[dhw] = s[dhw * C];
-                }
-            }
-        }
-        // HW 方向尾巴 (HW % HW_TILE)
-        for (; hw < HW; ++hw) {
-            for (int c = 0; c < C; ++c) {
-                dst[c * HW + hw] = src[hw * C + c];
             }
         }
     }
+        
 }
 
 #endif
