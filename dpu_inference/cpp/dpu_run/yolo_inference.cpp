@@ -70,9 +70,10 @@ void benchmark(
     // warmup
     for (int i = 0; i < warmup; ++i) {
         resize(img, in_w, resize_result);
-        norm(resize_result.img, norm_img);
+        // norm(resize_result.img, norm_img);
 
-        float2fix(norm_img, in_fix_point, dpu_input);
+        // float2fix(norm_img, in_fix_point, dpu_input);
+        norm_and_fix(resize_result.img, in_fix_point, dpu_input);
         engine.run();  // 內部已做 NHWC → NCHW 轉置
 
         for (size_t out_idx = 0; out_idx < engine.num_outputs(); ++out_idx) {
@@ -92,12 +93,16 @@ void benchmark(
         resize(img, in_w, resize_result);
         t_resize += time_now() - t0;
 
-        t0 = time_now();
-        norm(resize_result.img, norm_img);
-        t_norm += time_now() - t0;
+        // t0 = time_now();
+        // norm(resize_result.img, norm_img);
+        // t_norm += time_now() - t0;
+
+        // t0 = time_now();
+        // float2fix(norm_img, in_fix_point, dpu_input);
+        // t_f2f += time_now() - t0;
 
         t0 = time_now();
-        float2fix(norm_img, in_fix_point, dpu_input);
+        norm_and_fix(resize_result.img, in_fix_point, dpu_input);
         t_f2f += time_now() - t0;
     }
 
@@ -136,9 +141,11 @@ void benchmark(
 
     std::cout << "===== 前處理 =====\n";
     std::cout << "Resize avg      : " << t_resize / iter << " ms\n";
-    std::cout << "Norm avg        : " << t_norm / iter   << " ms\n";
-    std::cout << "Float2Fix avg   : " << t_f2f / iter    << " ms (Zero-copy)\n";
-    double preprocess = (t_resize + t_norm + t_f2f) / iter;
+    // std::cout << "Norm avg        : " << t_norm / iter   << " ms\n";
+    // std::cout << "Float2Fix avg   : " << t_f2f / iter    << " ms (Zero-copy)\n";
+    // double preprocess = (t_resize + t_norm + t_f2f) / iter;
+    std::cout << "Norm_Fix avg   : " << t_f2f / iter    << " ms\n";
+    double preprocess = (t_resize + t_f2f) / iter;
     std::cout << "Total preprocess: " << preprocess << " ms\n";
 
     std::cout << "\n===== 推理 =====\n";

@@ -219,7 +219,7 @@ public:
     void run(const cv::Mat& input_img);
 
     const std::vector<cv::Mat>& output_mats() const { return outputs_; }
-    const cv::Mat& output_mat(size_t idx) const { return outputs_.at(idx); }
+    const cv::Mat& output_mat_nchw(size_t idx) const { return outputs_.at(idx); }
 
     int64_t in_c() const { return ch_; }
     int64_t in_h() const { return in_h_; }

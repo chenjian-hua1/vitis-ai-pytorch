@@ -907,7 +907,6 @@ XmodelInferenceEngine::XmodelInferenceEngine(const std::string& xmodel_path)
 }
 
 XmodelInferenceEngine::~XmodelInferenceEngine() = default;
-dst
 
 void XmodelInferenceEngine::initialize_model_info(const std::string& xmodel_path)
 {
