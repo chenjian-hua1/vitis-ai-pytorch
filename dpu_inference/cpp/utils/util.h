@@ -192,6 +192,67 @@ private:
 
 
 // ============================================================================
+//  Camera Process
+// ============================================================================
+
+/**
+ * Camera — 封裝 cv::VideoCapture 的輕量包裝類別
+ *
+ * 預設行為：open() 時自動要求驅動使用最高解析度與最高 FPS，
+ * 實際值由硬體決定，可透過 actualWidth() / actualHeight() / actualFps() 查詢。
+ *
+ * 使用方式：
+ *   Camera cam(0);
+ *   cam.open();
+ *   cv::Mat frame;
+ *   while (cam.nextFrame(frame)) {
+ *       // 使用 frame ...
+ *   }
+ *   cam.close();
+ */
+class Camera {
+public:
+    struct Config {
+        int index = 0;   // 攝影機編號
+    };
+ 
+    explicit Camera(int index = 0);
+    explicit Camera(const Config& cfg);
+    ~Camera();
+ 
+    // 禁止複製（VideoCapture 不可複製）
+    Camera(const Camera&)            = delete;
+    Camera& operator=(const Camera&) = delete;
+ 
+    /** 開啟攝影機，成功回傳 true */
+    bool open();
+ 
+    /** 擷取下一幀；成功回傳 true，frame 內含影像資料 */
+    bool nextFrame(cv::Mat& frame);
+ 
+    /** 關閉攝影機並釋放資源 */
+    void close();
+ 
+    /** 查詢攝影機是否已開啟 */
+    bool isOpened() const;
+ 
+    // --- 實際套用的參數（open() 後才有效） ---
+    int    actualWidth()  const { return m_actualWidth;  }
+    int    actualHeight() const { return m_actualHeight; }
+    double actualFps()    const { return m_actualFps;    }
+ 
+private:
+    Config             m_cfg;
+    cv::VideoCapture   m_cap;
+    int                m_actualWidth  = 0;
+    int                m_actualHeight = 0;
+    double             m_actualFps    = 0.0;
+};
+ 
+
+
+
+// ============================================================================
 //  Visualization
 // ============================================================================
 

@@ -393,7 +393,9 @@ void YOLOPostProcessor::classify_and_build_mask(float conf_thresh)
 
         const std::vector<const float*>& cls_raw = cls_raw_rows_[b];
 
+        // Scan Anthor
         for (int a = 0; a < A; ++a) {
+            // find max confidence
             float max_l  = cls_raw[0][a];
             int   max_id = 0;
             for (int c = 1; c < nc_; ++c) {
@@ -401,14 +403,17 @@ void YOLOPostProcessor::classify_and_build_mask(float conf_thresh)
                 if (v > max_l) { max_l = v; max_id = c; }
             }
 
+            // confidence <= th : jump
             if (max_l <= logit_thresh) continue;
 
+            // confidence > th : record position, score, cls
             active_indices_[b].push_back(a);
             float max_s = 1.f / (1.f + expf(-max_l));
             active_max_score_[b].push_back(max_s);
             active_max_cls_[b].push_back(max_id);
         }
 
+        // 下面有需要嘛？ 上面不是都把最大機率算出來了，下面應該不用再算一次吧
         const int n_active = static_cast<int>(active_indices_[b].size());
 
         if (nc_ > 1 && n_active > 0) {
@@ -418,9 +423,11 @@ void YOLOPostProcessor::classify_and_build_mask(float conf_thresh)
             const int* RESTRICT act = active_indices_[b].data();
             float* RESTRICT dst = scores.data();
 
+            // 掃描全部 Activate Anchor (conf>th部份)
             for (int i = 0; i < n_active; ++i) {
                 const int a = act[i];
                 float* RESTRICT row = dst + static_cast<size_t>(i) * nc_;
+                // 計算每個 cls 的機率 (softmax) 
                 for (int c = 0; c < nc_; ++c)
                     row[c] = 1.f / (1.f + expf(-cls_raw[c][a]));
             }
@@ -731,6 +738,87 @@ cv::Mat draw_boxes(const cv::Mat&                  img,
 
     return out;
 }
+
+
+// ============================================================================
+//  Camera Process
+// ============================================================================
+// ── 建構子 ──────────────────────────────────────────────────────────────────
+ 
+Camera::Camera(int index)
+{
+    m_cfg.index = index;
+}
+ 
+Camera::Camera(const Config& cfg)
+    : m_cfg(cfg)
+{}
+ 
+Camera::~Camera()
+{
+    close();
+}
+ 
+// ── 公開介面 ─────────────────────────────────────────────────────────────────
+ 
+bool Camera::open()
+{
+    m_cap.open(m_cfg.index);
+ 
+    if (!m_cap.isOpened()) {
+        std::cerr << "[Camera] 無法開啟攝影機 (index="
+                  << m_cfg.index << ")" << std::endl;
+        return false;
+    }
+ 
+    // 要求驅動使用最高解析度與最高 FPS
+    // 傳入極大值，驅動會自動夾回硬體所支援的上限
+    m_cap.set(cv::CAP_PROP_FRAME_WIDTH,  std::numeric_limits<int>::max());
+    m_cap.set(cv::CAP_PROP_FRAME_HEIGHT, std::numeric_limits<int>::max());
+    m_cap.set(cv::CAP_PROP_FPS,          std::numeric_limits<int>::max());
+
+    // 可改用未壓縮的 YUYV 格式（頻寬需求較高，解析度/FPS 上限可能下降）：
+    m_cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('Y','U','Y','V'));
+ 
+    // 讀回驅動實際套用的值
+    m_actualWidth  = static_cast<int>(m_cap.get(cv::CAP_PROP_FRAME_WIDTH));
+    m_actualHeight = static_cast<int>(m_cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+    m_actualFps    = m_cap.get(cv::CAP_PROP_FPS);
+ 
+    std::cout << "[Camera] 開啟成功  "
+              << m_actualWidth << "x" << m_actualHeight
+              << " @ " << m_actualFps << " fps" << std::endl;
+    return true;
+}
+ 
+bool Camera::nextFrame(cv::Mat& frame)
+{
+    if (!m_cap.isOpened()) {
+        std::cerr << "[Camera] 攝影機尚未開啟，請先呼叫 open()" << std::endl;
+        return false;
+    }
+ 
+    if (!m_cap.read(frame) || frame.empty()) {
+        std::cerr << "[Camera] 無法擷取影像" << std::endl;
+        return false;
+    }
+ 
+    return true;
+}
+ 
+void Camera::close()
+{
+    if (m_cap.isOpened()) {
+        m_cap.release();
+        std::cout << "[Camera] 已關閉" << std::endl;
+    }
+}
+ 
+bool Camera::isOpened() const
+{
+    return m_cap.isOpened();
+}
+
 
 
 #ifdef ONNX_MODE

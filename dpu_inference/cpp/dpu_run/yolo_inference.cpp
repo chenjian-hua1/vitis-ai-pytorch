@@ -12,6 +12,12 @@
 #include <fstream>
 #include <regex>
 #include <cstring>
+#include <csignal>
+
+// 偵測 Ctrl-C
+static volatile bool g_running = true;
+void signalHandler(int) { g_running = false; }
+ 
 
 using Clock = std::chrono::high_resolution_clock;
 
@@ -207,6 +213,9 @@ void benchmark(
 
 void run_video(std::string xmodel_path, std::string video_path, std::string out_file = "",
                double conf_th = 0.1, double iou_th = 0.45) {
+    // ─────────────────────────────────────────────────────────────
+    //  1. 載入 Xmodel & 基本設定
+    // ─────────────────────────────────────────────────────────────
     XmodelInferenceEngine engine(xmodel_path);
 
     const int in_w = static_cast<int>(engine.in_w());
@@ -241,15 +250,19 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
         out_fix_points[i] = static_cast<int>(std::round(-std::log2(engine.output_scale(i))));
     }
 
+    // ─────────────────────────────────────────────────────────────
+    //  2. 讀取影片 Frames
+    // ─────────────────────────────────────────────────────────────
     std::string ext = std::filesystem::path(video_path).extension().string();
     if (!ext.empty() && ext.front() == '.') ext.erase(0, 1);
     std::transform(ext.begin(), ext.end(), ext.begin(),
                    [](unsigned char c) { return std::tolower(c); });
 
-// ====================== 一般影片 =========================
+    // 一般影片
     if (ext == "mp4" || ext == "avi" || ext == "mov" || ext == "mkv" ||
         ext == "flv" || ext == "wmv" || ext == "webm" || ext == "m4v")
     {
+        // ─── 影片 Reader Writer 設定 ───────────────────────────────────────────
         std::ostringstream pipe;
         pipe << "filesrc location=" << video_path << " ! "
             << "qtdemux ! h264parse ! omxh264dec ! "
@@ -291,6 +304,7 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
             }
         }
 
+        // ─── 讀取每個 frame 進行推理 ───────────────────────────────────────────
         cv::Mat frame, raw_nv12;
         int frame_idx = 0;
         double t_start = time_now();
@@ -299,6 +313,7 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
         double inst_fps = 0.0;
 
         while (cap.read(raw_nv12)) {
+            // ─── 逐 frame 推理 ───────────────────────────────────────────────
             if (raw_nv12.empty()) break;
             cv::cvtColor(raw_nv12, frame, cv::COLOR_YUV2BGR_NV12);
 
@@ -315,6 +330,7 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
 
             nms_result = &yolo_pp.process(float_outputs, conf_th, iou_th);
 
+            // ─── 時間計數  ──────────────────────────────────────────────────
             ++frame_idx;
 
             if (frame_idx % 30 == 0) {
@@ -329,6 +345,7 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
                     << "  FPS: " << std::fixed << std::setprecision(2) << inst_fps
                     << std::flush;
 
+            // ─── 繪圖  ─────────────────────────────────────────────────────
             if (save_video && writer.isOpened()) {
                 const DetectionBatch& last = (*nms_result)[0];
                 cv::Mat drawn;
@@ -369,21 +386,136 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
             }
         }
 
+        // ─── 關閉影片 Reader, Writer ───────────────────────────────────────────
         if (save_video && writer.isOpened()) writer.release();
+        if (save_video && !out_file.empty()) {
+            std::cout << "結果影片已存至: " << out_file << "\n";
+        }
 
+        // ─── 計算平均 FPS ──────────────────────────────────────────────────────
         double t_end     = time_now();
         double total_ms  = t_end - t_start;
         double avg_fps   = frame_idx * 1000.0 / total_ms;
         std::cout << "\nTotal: " << frame_idx << " frames in "
                 << total_ms / 1000.0 << " s  (avg " << avg_fps << " FPS)\n";
-
-        if (save_video && !out_file.empty()) {
-            std::cout << "結果影片已存至: " << out_file << "\n";
-        }
     }
     else {
         std::cerr << "不支援的副檔名: " << ext << "\n";
     }
+}
+
+
+void run_camera(std::string xmodel_path, int cameraIdx=0, std::string out_file = "",
+               double conf_th = 0.1, double iou_th = 0.45) {
+    std::signal(SIGINT, signalHandler);
+
+    // ─────────────────────────────────────────────────────────────
+    //  1. 載入 Xmodel & 基本設定
+    // ─────────────────────────────────────────────────────────────
+    XmodelInferenceEngine engine(xmodel_path);
+
+    const int in_w = static_cast<int>(engine.in_w());
+    const int in_h = static_cast<int>(engine.in_h());
+    std::cout << "模型輸入: " << in_w << "x" << in_h
+              << "  輸出數量: " << engine.num_outputs() << "\n";
+
+    const int ch = 16;
+    const int no = engine.output_mat_nchw(0).size[1];
+    const int nc = no - 4 * ch;
+
+    if (nc <= 0) {
+        std::cerr << "模型輸出 channel 數 (" << no
+                  << ") 與 YOLO DFL 頭假設不符 (ch=" << ch << ")\n";
+        return;
+    }
+    std::cout << "推導出的 nc = " << nc << "\n";
+
+    YOLOPostProcessor yolo_pp(1, in_h, in_w, nc, ch);
+
+    ResizeResult resize_result;
+    cv::Mat norm_img;
+    std::vector<cv::Mat> float_outputs(engine.num_outputs());
+    const std::vector<DetectionBatch>* nms_result = nullptr;
+
+    cv::Mat dpu_input;
+    engine.bind_input_mat(dpu_input);
+
+    int in_fix_point = static_cast<int>(std::round(std::log2(engine.input_scale())));
+    std::vector<int> out_fix_points(engine.num_outputs());
+    for (size_t i = 0; i < engine.num_outputs(); ++i) {
+        out_fix_points[i] = static_cast<int>(std::round(-std::log2(engine.output_scale(i))));
+    }
+ 
+    // ─────────────────────────────────────────────────────────────
+    //  2. Camera Setting
+    // ─────────────────────────────────────────────────────────────
+    Camera::Config cfg;
+    cfg.index  = cameraIdx;
+ 
+    Camera cam(cfg);
+ 
+    if (!cam.open()) {
+        return ;
+    }
+ 
+    std::cout << "按 Ctrl+C 停止擷取" << std::endl;
+
+    // ─────────────────────────────────────────────────────────────
+    //  3. 讀取 Frame 進行推理
+    // ─────────────────────────────────────────────────────────────
+    cv::Mat frame;
+    long long frameCount = 0;
+    double t_start = time_now();
+    double t_prev  = t_start;
+    int    prev_idx = 0;
+    double inst_fps = 0.0;
+
+    while (g_running)
+    {
+        // ─── 讀取 Frame ──────────────────────────────────────────────────
+        if (!cam.nextFrame(frame)) {
+            break;
+        }
+
+        // ─── 逐 frame 推理 ───────────────────────────────────────────────
+        resize(frame, in_w, resize_result);
+        norm_and_fix(frame, in_fix_point, dpu_input);
+        engine.run();
+
+        for (size_t out_idx = 0; out_idx < engine.num_outputs(); ++out_idx) {
+            fix2float(engine.output_mat_nchw(out_idx),
+                        out_fix_points[out_idx],
+                        float_outputs[out_idx]);
+        }
+
+        nms_result = &yolo_pp.process(float_outputs, conf_th, iou_th);
+ 
+        // ─── 時間計數  ──────────────────────────────────────────────────
+        ++frameCount;
+ 
+        if (frameCount % 30 == 0) {
+            double t_now = time_now();
+            double dt_ms = t_now - t_prev;
+            inst_fps = (frameCount - prev_idx) * 1000.0 / dt_ms;
+            t_prev   = t_now;
+            prev_idx = frameCount;
+
+            std::cout << "\rFrame: " << frameCount
+                << "  FPS: " << std::fixed << std::setprecision(2) << inst_fps
+                << std::flush;
+        }
+    }
+
+    // ── 關閉攝影機 ─────────────────────────────────────────────────────────
+    cam.close();
+    std::cout << "共擷取 " << frameCount << " 幀，程式結束。" << std::endl;
+
+    // ── 計算平均 FPS ──────────────────────────────────────────────────────
+    double t_end     = time_now();
+    double total_ms  = t_end - t_start;
+    double avg_fps   = frameCount * 1000.0 / total_ms;
+    std::cout << "\nTotal: " << frameCount << " frames in "
+            << total_ms / 1000.0 << " s  (avg " << avg_fps << " FPS)\n";
 }
 
 
@@ -471,31 +603,33 @@ int main(int argc, char** argv) {
     const float CONF   = 0.1f;
     const float IOU    = 0.45f;
 
-    switch (args.task) {
-        case Task::Benchmark: {
-            cv::Mat img = cv::imread(args.input_path);
-            if (img.empty()) {
-                std::cerr << "無法開啟影像: " << args.input_path << "\n";
-                return -1;
-            }
-            std::cout << "[Task] benchmark\n";
-            std::cout << "  input: " << args.input_path << "\n";
-            std::cout << "  model: " << args.model_path << "\n";
-            benchmark(args.model_path, img, WARMUP, ITER, CONF, IOU);
-            break;
-        }
-        case Task::Video: {
-            std::cout << "[Task] video\n";
-            std::cout << "  input: " << args.input_path << "\n";
-            std::cout << "  model: " << args.model_path << "\n";
-            if (!args.out_path.empty())
-                std::cout << "  out  : " << args.out_path << "\n";
-            else
-                std::cout << "  out  : (不寫出)\n";
-            run_video(args.model_path, args.input_path, args.out_path, CONF, IOU);
-            break;
-        }
-    }
+    // switch (args.task) {
+    //     case Task::Benchmark: {
+    //         cv::Mat img = cv::imread(args.input_path);
+    //         if (img.empty()) {
+    //             std::cerr << "無法開啟影像: " << args.input_path << "\n";
+    //             return -1;
+    //         }
+    //         std::cout << "[Task] benchmark\n";
+    //         std::cout << "  input: " << args.input_path << "\n";
+    //         std::cout << "  model: " << args.model_path << "\n";
+    //         benchmark(args.model_path, img, WARMUP, ITER, CONF, IOU);
+    //         break;
+    //     }
+    //     case Task::Video: {
+    //         std::cout << "[Task] video\n";
+    //         std::cout << "  input: " << args.input_path << "\n";
+    //         std::cout << "  model: " << args.model_path << "\n";
+    //         if (!args.out_path.empty())
+    //             std::cout << "  out  : " << args.out_path << "\n";
+    //         else
+    //             std::cout << "  out  : (不寫出)\n";
+    //         run_video(args.model_path, args.input_path, args.out_path, CONF, IOU);
+    //         break;
+    //     }
+    // }
+
+    run_camera(args.model_path, 0, "", CONF, IOU);
 
     return 0;
 }
