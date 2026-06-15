@@ -457,6 +457,9 @@ void run_camera(std::string xmodel_path, int cameraIdx=0, std::string out_file =
     if (!cam.open()) {
         return ;
     }
+
+    FrameGrabber grabber(cam);
+    grabber.start();
  
     std::cout << "按 Ctrl+C 停止擷取" << std::endl;
 
@@ -465,19 +468,31 @@ void run_camera(std::string xmodel_path, int cameraIdx=0, std::string out_file =
     // ─────────────────────────────────────────────────────────────
     cv::Mat frame;
     long long frameCount = 0;
-    double t_start = time_now();
-    double t_prev  = t_start;
-    int    prev_idx = 0;
-    double inst_fps = 0.0;
+    long long lastFrameId = -1, curFrameId = -1;
+ 
+    double t_prev = time_now();
+    long long prev_idx = 0;
+ 
+    // 分段耗時統計
+    double sum_wait_ms  = 0;  // 等待新幀的時間
+    double sum_infer_ms = 0;  // 推理 pipeline 耗時
 
     while (g_running)
     {
-        // ─── 讀取 Frame ──────────────────────────────────────────────────
-        if (!cam.nextFrame(frame)) {
-            break;
+        // ─── 等待新的一幀（非阻塞 polling，背景執行緒已在跑）───────────────────
+        double t_wait0 = time_now();
+        while (g_running) {
+            if (grabber.getLatest(frame, curFrameId) && curFrameId != lastFrameId) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
+        if (!g_running) break;
+        lastFrameId = curFrameId;
+        double t_wait1 = time_now();
 
         // ─── 逐 frame 推理 ───────────────────────────────────────────────
+        double t_inf0 = time_now();
         resize(frame, in_w, resize_result);
         norm_and_fix(frame, in_fix_point, dpu_input);
         engine.run();
@@ -491,31 +506,38 @@ void run_camera(std::string xmodel_path, int cameraIdx=0, std::string out_file =
         nms_result = &yolo_pp.process(float_outputs, conf_th, iou_th);
  
         // ─── 時間計數  ──────────────────────────────────────────────────
+        double t_inf1 = time_now();
+
+        sum_wait_ms  += (t_wait1 - t_wait0);
+        sum_infer_ms += (t_inf1 - t_inf0);
         ++frameCount;
  
         if (frameCount % 30 == 0) {
-            double t_now = time_now();
-            double dt_ms = t_now - t_prev;
-            inst_fps = (frameCount - prev_idx) * 1000.0 / dt_ms;
+            double t_now  = time_now();
+            double dt_ms  = t_now - t_prev;
+            double inst_fps = (frameCount - prev_idx) * 1000.0 / dt_ms;
             t_prev   = t_now;
             prev_idx = frameCount;
-
+ 
+            double avg_wait  = sum_wait_ms  / 30.0;
+            double avg_infer = sum_infer_ms / 30.0;
+ 
             std::cout << "\rFrame: " << frameCount
-                << "  FPS: " << std::fixed << std::setprecision(2) << inst_fps
-                << std::flush;
+                      << "  FPS: "        << std::fixed << std::setprecision(2) << inst_fps
+                      << "  | Wait: "     << avg_wait  << " ms"
+                      << "  | Infer: "    << avg_infer << " ms"
+                      << "  | GrabberFps: " << grabber.frameId() // debug: 背景擷取總幀數
+                      << std::endl;
+ 
+            sum_wait_ms  = 0;
+            sum_infer_ms = 0;
         }
     }
 
     // ── 關閉攝影機 ─────────────────────────────────────────────────────────
     cam.close();
+    grabber.stop();
     std::cout << "共擷取 " << frameCount << " 幀，程式結束。" << std::endl;
-
-    // ── 計算平均 FPS ──────────────────────────────────────────────────────
-    double t_end     = time_now();
-    double total_ms  = t_end - t_start;
-    double avg_fps   = frameCount * 1000.0 / total_ms;
-    std::cout << "\nTotal: " << frameCount << " frames in "
-            << total_ms / 1000.0 << " s  (avg " << avg_fps << " FPS)\n";
 }
 
 
