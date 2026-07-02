@@ -763,7 +763,7 @@ Camera::~Camera()
  
 bool Camera::open()
 {
-    m_cap.open(m_cfg.index);
+    m_cap.open(m_cfg.index, cv::CAP_V4L2);
  
     if (!m_cap.isOpened()) {
         std::cerr << "[Camera] 無法開啟攝影機 (index="
@@ -773,12 +773,13 @@ bool Camera::open()
  
     // 要求驅動使用最高解析度與最高 FPS
     // 傳入極大值，驅動會自動夾回硬體所支援的上限
-    m_cap.set(cv::CAP_PROP_FRAME_WIDTH,  std::numeric_limits<int>::max());
-    m_cap.set(cv::CAP_PROP_FRAME_HEIGHT, std::numeric_limits<int>::max());
+    // m_cap.set(cv::CAP_PROP_FRAME_WIDTH,  std::numeric_limits<int>::max());
+    // m_cap.set(cv::CAP_PROP_FRAME_HEIGHT, std::numeric_limits<int>::max());
+    m_cap.set(cv::CAP_PROP_FRAME_WIDTH,  1280);
+    m_cap.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
     m_cap.set(cv::CAP_PROP_FPS,          std::numeric_limits<int>::max());
 
-    // 可改用未壓縮的 YUYV 格式（頻寬需求較高，解析度/FPS 上限可能下降）：
-    m_cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('Y','U','Y','V'));
+    m_cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M','J','P','G'));
  
     // 讀回驅動實際套用的值
     m_actualWidth  = static_cast<int>(m_cap.get(cv::CAP_PROP_FRAME_WIDTH));
@@ -1190,3 +1191,158 @@ void XmodelInferenceEngine::run()
 }
 
 #endif
+
+
+// 狀態向量 x (8x1): [cx, cy, w, h, vx, vy, vw, vh]
+//   cx,cy = 中心點座標  w,h = 寬高  v* = 對應的速度(每偵變化量)
+// 量測向量 z (4x1): [cx, cy, w, h]  <- 由 YOLO 偵測框轉來
+ 
+#include <vector>
+#include <cmath>
+#include <iostream>
+#include <iomanip>
+ 
+// ======================= 極簡矩陣工具 =======================
+struct Mat {
+    int r = 0, c = 0;
+    std::vector<double> d;
+    Mat() {}
+    Mat(int r, int c) : r(r), c(c), d(r * c, 0.0) {}
+    double&       operator()(int i, int j)       { return d[i * c + j]; }
+    double        operator()(int i, int j) const { return d[i * c + j]; }
+    static Mat I(int n) { Mat m(n, n); for (int i = 0; i < n; ++i) m(i, i) = 1.0; return m; }
+};
+ 
+static Mat operator*(const Mat& a, const Mat& b) {
+    Mat o(a.r, b.c);
+    for (int i = 0; i < a.r; ++i)
+        for (int k = 0; k < a.c; ++k) {
+            double v = a(i, k);
+            if (v == 0.0) continue;
+            for (int j = 0; j < b.c; ++j) o(i, j) += v * b(k, j);
+        }
+    return o;
+}
+static Mat operator+(const Mat& a, const Mat& b) {
+    Mat o(a.r, a.c);
+    for (size_t i = 0; i < a.d.size(); ++i) o.d[i] = a.d[i] + b.d[i];
+    return o;
+}
+static Mat operator-(const Mat& a, const Mat& b) {
+    Mat o(a.r, a.c);
+    for (size_t i = 0; i < a.d.size(); ++i) o.d[i] = a.d[i] - b.d[i];
+    return o;
+}
+static Mat transpose(const Mat& a) {
+    Mat o(a.c, a.r);
+    for (int i = 0; i < a.r; ++i)
+        for (int j = 0; j < a.c; ++j) o(j, i) = a(i, j);
+    return o;
+}
+// Gauss-Jordan 求反矩陣 (KF 裡只會對 4x4 的 S 求逆，用這個很夠)
+static Mat inverse(Mat a) {
+    int n = a.r;
+    Mat inv = Mat::I(n);
+    for (int col = 0; col < n; ++col) {
+        int piv = col;
+        double best = std::fabs(a(col, col));
+        for (int r2 = col + 1; r2 < n; ++r2) {
+            double v = std::fabs(a(r2, col));
+            if (v > best) { best = v; piv = r2; }
+        }
+        if (piv != col)
+            for (int j = 0; j < n; ++j) {
+                std::swap(a(col, j), a(piv, j));
+                std::swap(inv(col, j), inv(piv, j));
+            }
+        double pv = a(col, col);
+        for (int j = 0; j < n; ++j) { a(col, j) /= pv; inv(col, j) /= pv; }
+        for (int r2 = 0; r2 < n; ++r2) {
+            if (r2 == col) continue;
+            double f = a(r2, col);
+            for (int j = 0; j < n; ++j) { a(r2, j) -= f * a(col, j); inv(r2, j) -= f * inv(col, j); }
+        }
+    }
+    return inv;
+}
+ 
+// ======================= bbox 格式轉換 =======================
+struct Box { double x1, y1, x2, y2; };            // YOLO 常見輸出格式
+struct CxCyWH { double cx, cy, w, h; };
+ 
+static CxCyWH toCenter(const Box& b) {
+    double w = b.x2 - b.x1, h = b.y2 - b.y1;
+    return { b.x1 + w / 2.0, b.y1 + h / 2.0, w, h };
+}
+static Box toXYXY(const CxCyWH& c) {
+    return { c.cx - c.w / 2.0, c.cy - c.h / 2.0,
+             c.cx + c.w / 2.0, c.cy + c.h / 2.0 };
+}
+ 
+// ======================= Kalman Box Tracker =======================
+class KalmanBoxTracker {
+public:
+    // 用第一次的偵測框初始化。dt = 兩偵之間的時間間隔(用「偵」當單位時填 1)
+    explicit KalmanBoxTracker(const CxCyWH& init, double dt = 1.0) {
+        x_ = Mat(8, 1);
+        x_(0, 0) = init.cx; x_(1, 0) = init.cy;
+        x_(2, 0) = init.w;  x_(3, 0) = init.h;   // 速度初始為 0
+ 
+        // 狀態轉移 F：等速模型 (constant velocity)
+        F_ = Mat::I(8);
+        F_(0, 4) = dt; F_(1, 5) = dt; F_(2, 6) = dt; F_(3, 7) = dt;
+ 
+        // 量測矩陣 H：只觀測 cx,cy,w,h
+        H_ = Mat(4, 8);
+        H_(0, 0) = H_(1, 1) = H_(2, 2) = H_(3, 3) = 1.0;
+ 
+        // 初始協方差 P：速度完全未知，所以設很大
+        P_ = Mat::I(8);
+        for (int i = 0; i < 4; ++i) P_(i, i) = 10.0;      // 位置/尺寸
+        for (int i = 4; i < 8; ++i) P_(i, i) = 1000.0;    // 速度
+ 
+        // 過程雜訊 Q：模型可信度，越大越相信量測、追蹤越靈敏
+        Q_ = Mat::I(8);
+        for (int i = 0; i < 4; ++i) Q_(i, i) = 1.0;
+        for (int i = 4; i < 8; ++i) Q_(i, i) = 0.01;
+ 
+        // 量測雜訊 R：偵測器誤差，越大越相信模型(預測)、越平滑
+        R_ = Mat::I(4);
+        R_(0, 0) = R_(1, 1) = 1.0;
+        R_(2, 2) = R_(3, 3) = 10.0;   // w,h 通常比中心點抖
+    }
+ 
+    // 預測步：把狀態往前推一偵，回傳預測的 bbox。
+    // 每一偵開始、拿到新偵測「之前」呼叫。
+    CxCyWH predict() {
+        x_ = F_ * x_;
+        P_ = F_ * P_ * transpose(F_) + Q_;
+        return currentBox();
+    }
+ 
+    // 更新步：拿到當偵 YOLO 的偵測框後校正狀態。
+    void update(const CxCyWH& meas) {
+        Mat z(4, 1);
+        z(0, 0) = meas.cx; z(1, 0) = meas.cy;
+        z(2, 0) = meas.w;  z(3, 0) = meas.h;
+ 
+        Mat y = z - H_ * x_;                        // 殘差 (innovation)
+        Mat S = H_ * P_ * transpose(H_) + R_;       // 殘差協方差
+        Mat K = P_ * transpose(H_) * inverse(S);    // Kalman gain
+        x_ = x_ + K * y;
+        Mat I = Mat::I(8);
+        P_ = (I - K * H_) * P_;
+    }
+ 
+    // 目前估計的 bbox (中心點格式)
+    CxCyWH currentBox() const {
+        return { x_(0, 0), x_(1, 0), x_(2, 0), x_(3, 0) };
+    }
+    // 目前估計的速度 [vx, vy, vw, vh]
+    void velocity(double& vx, double& vy, double& vw, double& vh) const {
+        vx = x_(4, 0); vy = x_(5, 0); vw = x_(6, 0); vh = x_(7, 0);
+    }
+ 
+private:
+    Mat x_, P_, F_, H_, Q_, R_;
+};

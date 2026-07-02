@@ -77,14 +77,16 @@ int main(int argc, char* argv[])
     std::cout << "=== Busy-wait 檢測 + MJPEG解碼耗時測試 ===" << std::endl;
     std::cout << "camera=" << camIndex << "  frames=" << numFrames << "\n" << std::endl;
 
-    cv::VideoCapture cap(camIndex);
+    cv::VideoCapture cap(camIndex, cv::CAP_V4L2);
     if (!cap.isOpened()) {
         std::cerr << "無法開啟攝影機" << std::endl;
         return -1;
     }
 
-    cap.set(cv::CAP_PROP_FRAME_WIDTH,  std::numeric_limits<int>::max());
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, std::numeric_limits<int>::max());
+    // cap.set(cv::CAP_PROP_FRAME_WIDTH,  std::numeric_limits<int>::max());
+    // cap.set(cv::CAP_PROP_FRAME_HEIGHT, std::numeric_limits<int>::max());
+    cap.set(cv::CAP_PROP_FRAME_WIDTH,  1280);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
     cap.set(cv::CAP_PROP_FPS,          std::numeric_limits<int>::max());
 
     int actualW = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
@@ -197,6 +199,7 @@ int main(int argc, char* argv[])
                   << (1000.0/actualFps) << "ms)，行為正常（阻塞等待硬體）。" << std::endl;
     }
 
+    std::cout << cv::getBuildInformation() << std::endl;
     // 解碼成本判斷
     std::cout << std::endl;
     if (retS.avg > grabS.avg) {
