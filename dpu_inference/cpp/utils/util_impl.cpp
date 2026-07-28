@@ -9,7 +9,11 @@
 #include <numeric>
 #include <stdexcept>
 
+
+
 #if defined(__GNUC__) || defined(__clang__)
+// 指標有可能指到同一塊記憶體 如果做層層運算時可能會互相影響只能照順序
+// 需要都設成指到的記憶體空間都是獨立不同 不會有相依性才能平行化
 #  define RESTRICT __restrict__
 #else
 #  define RESTRICT
@@ -298,13 +302,9 @@ void YOLOPostProcessor::allocate_buffers()
     }
 
     active_indices_.assign(B_, {});
-    active_max_score_.assign(B_, {});
-    active_max_cls_.assign(B_, {});
     active_cls_scores_.assign(B_, {});
     for (int b = 0; b < B_; ++b) {
         active_indices_[b].reserve(A_);
-        active_max_score_[b].reserve(A_);
-        active_max_cls_[b].reserve(A_);
         active_cls_scores_[b].reserve(A_ * nc_);
     }
 }
@@ -387,33 +387,21 @@ void YOLOPostProcessor::classify_and_build_mask(float conf_thresh)
 
     for (int b = 0; b < B_; ++b) {
         active_indices_[b].clear();
-        active_max_score_[b].clear();
-        active_max_cls_[b].clear();
-        active_cls_scores_[b].clear();
 
         const std::vector<const float*>& cls_raw = cls_raw_rows_[b];
 
         // Scan Anthor
         for (int a = 0; a < A; ++a) {
-            // find max confidence
-            float max_l  = cls_raw[0][a];
-            int   max_id = 0;
-            for (int c = 1; c < nc_; ++c) {
-                float v = cls_raw[c][a];
-                if (v > max_l) { max_l = v; max_id = c; }
+            for (int c = 0; c < nc_; ++c) {
+                if (cls_raw[c][a] > logit_thresh) 
+                {
+                    // confidence > th : record position, score, cls
+                    active_indices_[b].push_back(a);
+                    break; 
+                }
             }
-
-            // confidence <= th : jump
-            if (max_l <= logit_thresh) continue;
-
-            // confidence > th : record position, score, cls
-            active_indices_[b].push_back(a);
-            float max_s = 1.f / (1.f + expf(-max_l));
-            active_max_score_[b].push_back(max_s);
-            active_max_cls_[b].push_back(max_id);
         }
 
-        // 下面有需要嘛？ 上面不是都把最大機率算出來了，下面應該不用再算一次吧
         const int n_active = static_cast<int>(active_indices_[b].size());
 
         if (nc_ > 1 && n_active > 0) {
@@ -427,7 +415,7 @@ void YOLOPostProcessor::classify_and_build_mask(float conf_thresh)
             for (int i = 0; i < n_active; ++i) {
                 const int a = act[i];
                 float* RESTRICT row = dst + static_cast<size_t>(i) * nc_;
-                // 計算每個 cls 的機率 (softmax) 
+                // 計算每個 cls 的機率 (sigmoid) 
                 for (int c = 0; c < nc_; ++c)
                     row[c] = 1.f / (1.f + expf(-cls_raw[c][a]));
             }
@@ -454,6 +442,7 @@ void YOLOPostProcessor::dfl_decode_masked()
                 ch_rows[c] = box_raw_rows_[b][base + c];
 
             for (int i = 0; i < N; ++i) {
+                // softmax
                 const int a = act[i];
 
                 float max_l = ch_rows[0][a];
@@ -563,8 +552,6 @@ void YOLOPostProcessor::nms_single_batch(int b,
     const float* hh_row = output_h_rows_[b];
 
     const std::vector<int>&   act         = active_indices_[b];
-    const std::vector<float>& max_score   = active_max_score_[b];
-    const std::vector<int>&   max_cls     = active_max_cls_[b];
     const std::vector<float>& cls_scores  = active_cls_scores_[b];
     const int N = static_cast<int>(act.size());
 
@@ -588,8 +575,8 @@ void YOLOPostProcessor::nms_single_batch(int b,
                 }
             }
         } else {
-            (void)max_cls;
-            float score = max_score[i];
+            // nc_ == 1:直接對那唯一一類的 logit 取 sigmoid
+            float score = 1.f / (1.f + expf(-cls_raw_rows_[b][0][a]));
             if (cand_count_ < max_nms_) {
                 candidates_[cand_count_++] = {x1, y1, x2, y2, score, 0.f};
             }
@@ -656,91 +643,6 @@ const std::vector<DetectionBatch>& YOLOPostProcessor::process(
 }
 
 // ============================================================================
-//  Visualization
-// ============================================================================
-
-cv::Mat scale_boxes(const cv::Mat&        boxes,
-                    std::pair<float,float> ratio,
-                    std::pair<float,float> pad,
-                    cv::Size               orig_shape)
-{
-    cv::Mat out;
-    boxes.convertTo(out, CV_32F);
-
-    float w_max = static_cast<float>(orig_shape.width);
-    float h_max = static_cast<float>(orig_shape.height);
-
-    {
-        cv::Mat col = (out.col(0) - pad.first) / ratio.first;
-        cv::min(col, w_max, col);
-        cv::max(col, 0.f, col);
-        col.copyTo(out.col(0));
-    }
-    {
-        cv::Mat col = (out.col(1) - pad.second) / ratio.second;
-        cv::min(col, h_max, col);
-        cv::max(col, 0.f, col);
-        col.copyTo(out.col(1));
-    }
-    {
-        cv::Mat col = (out.col(2) - pad.first) / ratio.first;
-        cv::min(col, w_max, col);
-        cv::max(col, 0.f, col);
-        col.copyTo(out.col(2));
-    }
-    {
-        cv::Mat col = (out.col(3) - pad.second) / ratio.second;
-        cv::min(col, h_max, col);
-        cv::max(col, 0.f, col);
-        col.copyTo(out.col(3));
-    }
-
-    return out;
-}
-
-cv::Mat draw_boxes(const cv::Mat&                  img,
-                   const std::vector<Detection>&   detections,
-                   const std::vector<std::string>& class_names)
-{
-    cv::Mat out = img.clone();
-
-    for (const Detection& det : detections) {
-        int x1 = static_cast<int>(det.x1), y1 = static_cast<int>(det.y1);
-        int x2 = static_cast<int>(det.x2), y2 = static_cast<int>(det.y2);
-        int id = det.class_id;
-
-        cv::Scalar color(
-            (id * 67  + 100) % 255,
-            (id * 113 +  50) % 255,
-            (id * 179 + 150) % 255
-        );
-
-        cv::rectangle(out, cv::Point(x1, y1), cv::Point(x2, y2), color, 2);
-
-        std::string label = (class_names.size() > static_cast<size_t>(id))
-            ? class_names[id] + ": " + std::to_string(det.score).substr(0, 4)
-            : "Class " + std::to_string(id) + ": " +
-              std::to_string(det.score).substr(0, 4);
-
-        int      baseline = 0;
-        cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX,
-                                       0.5, 1, &baseline);
-
-        cv::rectangle(out,
-                       cv::Point(x1, y1 - ts.height - 6),
-                       cv::Point(x1 + ts.width, y1),
-                       color, cv::FILLED);
-
-        cv::putText(out, label, cv::Point(x1, y1 - 4),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5,
-                    cv::Scalar(255, 255, 255), 1);
-    }
-
-    return out;
-}
-
-
-// ============================================================================
 //  Camera Process
 // ============================================================================
 // ── 建構子 ──────────────────────────────────────────────────────────────────
@@ -771,13 +673,10 @@ bool Camera::open()
         return false;
     }
  
-    // 要求驅動使用最高解析度與最高 FPS
-    // 傳入極大值，驅動會自動夾回硬體所支援的上限
-    // m_cap.set(cv::CAP_PROP_FRAME_WIDTH,  std::numeric_limits<int>::max());
-    // m_cap.set(cv::CAP_PROP_FRAME_HEIGHT, std::numeric_limits<int>::max());
-    m_cap.set(cv::CAP_PROP_FRAME_WIDTH,  1280);
-    m_cap.set(cv::CAP_PROP_FRAME_HEIGHT, 720);
-    m_cap.set(cv::CAP_PROP_FPS,          std::numeric_limits<int>::max());
+    // 設定鏡頭參數
+    m_cap.set(cv::CAP_PROP_FRAME_WIDTH,  m_cfg.width);
+    m_cap.set(cv::CAP_PROP_FRAME_HEIGHT, m_cfg.height);
+    m_cap.set(cv::CAP_PROP_FPS,          m_cfg.fps);
 
     m_cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M','J','P','G'));
  
@@ -1036,7 +935,7 @@ void XmodelInferenceEngine::initialize_model_info(const std::string& xmodel_path
         size_t   size_bytes = 0u;
         std::tie(data_addr, size_bytes) = input_tensor_buffers_[0]->data({0, 0, 0, 0});
 
-        input_mat_ = cv::Mat(in_h_, in_w_, CV_8SC3, reinterpret_cast<void*>(data_addr));
+        input_mat_ = cv::Mat(in_h_, in_w_, CV_8SC3, reinterpret_cast<void*>(data_addr)); 
     }
 
     // ===== Output meta:建 NHWC 替身 + NCHW buffer + (條件性) cacheable 暫存區 =====
@@ -1139,7 +1038,7 @@ void XmodelInferenceEngine::run()
 
         // 5. NHWC → NCHW int8 轉置 (blocked + manual unroll×4, N=1)
     for (size_t i = 0; i < output_tensor_buffers_.size(); ++i) {
-        const auto& nchw = outputs_nchw_[i];
+        const cv::Mat& nchw = outputs_nchw_[i];
         const int C  = nchw.size[1];
         const int H  = nchw.size[2];
         const int W  = nchw.size[3];
@@ -1166,7 +1065,7 @@ void XmodelInferenceEngine::run()
                 for (int c = c0; c < c_end; ++c) {
                     // 計算數值的記憶體位置
                     int8_t* __restrict__ dst_row = dst + c * HW;
-                    const int8_t* __restrict__ src_c = src + c; // NHWC: stride=C
+                    const int8_t* __restrict__ src_c = src + c;  // NHWC: stride=C
 
                     int hw = hw0;
 
@@ -1191,158 +1090,3 @@ void XmodelInferenceEngine::run()
 }
 
 #endif
-
-
-// 狀態向量 x (8x1): [cx, cy, w, h, vx, vy, vw, vh]
-//   cx,cy = 中心點座標  w,h = 寬高  v* = 對應的速度(每偵變化量)
-// 量測向量 z (4x1): [cx, cy, w, h]  <- 由 YOLO 偵測框轉來
- 
-#include <vector>
-#include <cmath>
-#include <iostream>
-#include <iomanip>
- 
-// ======================= 極簡矩陣工具 =======================
-struct Mat {
-    int r = 0, c = 0;
-    std::vector<double> d;
-    Mat() {}
-    Mat(int r, int c) : r(r), c(c), d(r * c, 0.0) {}
-    double&       operator()(int i, int j)       { return d[i * c + j]; }
-    double        operator()(int i, int j) const { return d[i * c + j]; }
-    static Mat I(int n) { Mat m(n, n); for (int i = 0; i < n; ++i) m(i, i) = 1.0; return m; }
-};
- 
-static Mat operator*(const Mat& a, const Mat& b) {
-    Mat o(a.r, b.c);
-    for (int i = 0; i < a.r; ++i)
-        for (int k = 0; k < a.c; ++k) {
-            double v = a(i, k);
-            if (v == 0.0) continue;
-            for (int j = 0; j < b.c; ++j) o(i, j) += v * b(k, j);
-        }
-    return o;
-}
-static Mat operator+(const Mat& a, const Mat& b) {
-    Mat o(a.r, a.c);
-    for (size_t i = 0; i < a.d.size(); ++i) o.d[i] = a.d[i] + b.d[i];
-    return o;
-}
-static Mat operator-(const Mat& a, const Mat& b) {
-    Mat o(a.r, a.c);
-    for (size_t i = 0; i < a.d.size(); ++i) o.d[i] = a.d[i] - b.d[i];
-    return o;
-}
-static Mat transpose(const Mat& a) {
-    Mat o(a.c, a.r);
-    for (int i = 0; i < a.r; ++i)
-        for (int j = 0; j < a.c; ++j) o(j, i) = a(i, j);
-    return o;
-}
-// Gauss-Jordan 求反矩陣 (KF 裡只會對 4x4 的 S 求逆，用這個很夠)
-static Mat inverse(Mat a) {
-    int n = a.r;
-    Mat inv = Mat::I(n);
-    for (int col = 0; col < n; ++col) {
-        int piv = col;
-        double best = std::fabs(a(col, col));
-        for (int r2 = col + 1; r2 < n; ++r2) {
-            double v = std::fabs(a(r2, col));
-            if (v > best) { best = v; piv = r2; }
-        }
-        if (piv != col)
-            for (int j = 0; j < n; ++j) {
-                std::swap(a(col, j), a(piv, j));
-                std::swap(inv(col, j), inv(piv, j));
-            }
-        double pv = a(col, col);
-        for (int j = 0; j < n; ++j) { a(col, j) /= pv; inv(col, j) /= pv; }
-        for (int r2 = 0; r2 < n; ++r2) {
-            if (r2 == col) continue;
-            double f = a(r2, col);
-            for (int j = 0; j < n; ++j) { a(r2, j) -= f * a(col, j); inv(r2, j) -= f * inv(col, j); }
-        }
-    }
-    return inv;
-}
- 
-// ======================= bbox 格式轉換 =======================
-struct Box { double x1, y1, x2, y2; };            // YOLO 常見輸出格式
-struct CxCyWH { double cx, cy, w, h; };
- 
-static CxCyWH toCenter(const Box& b) {
-    double w = b.x2 - b.x1, h = b.y2 - b.y1;
-    return { b.x1 + w / 2.0, b.y1 + h / 2.0, w, h };
-}
-static Box toXYXY(const CxCyWH& c) {
-    return { c.cx - c.w / 2.0, c.cy - c.h / 2.0,
-             c.cx + c.w / 2.0, c.cy + c.h / 2.0 };
-}
- 
-// ======================= Kalman Box Tracker =======================
-class KalmanBoxTracker {
-public:
-    // 用第一次的偵測框初始化。dt = 兩偵之間的時間間隔(用「偵」當單位時填 1)
-    explicit KalmanBoxTracker(const CxCyWH& init, double dt = 1.0) {
-        x_ = Mat(8, 1);
-        x_(0, 0) = init.cx; x_(1, 0) = init.cy;
-        x_(2, 0) = init.w;  x_(3, 0) = init.h;   // 速度初始為 0
- 
-        // 狀態轉移 F：等速模型 (constant velocity)
-        F_ = Mat::I(8);
-        F_(0, 4) = dt; F_(1, 5) = dt; F_(2, 6) = dt; F_(3, 7) = dt;
- 
-        // 量測矩陣 H：只觀測 cx,cy,w,h
-        H_ = Mat(4, 8);
-        H_(0, 0) = H_(1, 1) = H_(2, 2) = H_(3, 3) = 1.0;
- 
-        // 初始協方差 P：速度完全未知，所以設很大
-        P_ = Mat::I(8);
-        for (int i = 0; i < 4; ++i) P_(i, i) = 10.0;      // 位置/尺寸
-        for (int i = 4; i < 8; ++i) P_(i, i) = 1000.0;    // 速度
- 
-        // 過程雜訊 Q：模型可信度，越大越相信量測、追蹤越靈敏
-        Q_ = Mat::I(8);
-        for (int i = 0; i < 4; ++i) Q_(i, i) = 1.0;
-        for (int i = 4; i < 8; ++i) Q_(i, i) = 0.01;
- 
-        // 量測雜訊 R：偵測器誤差，越大越相信模型(預測)、越平滑
-        R_ = Mat::I(4);
-        R_(0, 0) = R_(1, 1) = 1.0;
-        R_(2, 2) = R_(3, 3) = 10.0;   // w,h 通常比中心點抖
-    }
- 
-    // 預測步：把狀態往前推一偵，回傳預測的 bbox。
-    // 每一偵開始、拿到新偵測「之前」呼叫。
-    CxCyWH predict() {
-        x_ = F_ * x_;
-        P_ = F_ * P_ * transpose(F_) + Q_;
-        return currentBox();
-    }
- 
-    // 更新步：拿到當偵 YOLO 的偵測框後校正狀態。
-    void update(const CxCyWH& meas) {
-        Mat z(4, 1);
-        z(0, 0) = meas.cx; z(1, 0) = meas.cy;
-        z(2, 0) = meas.w;  z(3, 0) = meas.h;
- 
-        Mat y = z - H_ * x_;                        // 殘差 (innovation)
-        Mat S = H_ * P_ * transpose(H_) + R_;       // 殘差協方差
-        Mat K = P_ * transpose(H_) * inverse(S);    // Kalman gain
-        x_ = x_ + K * y;
-        Mat I = Mat::I(8);
-        P_ = (I - K * H_) * P_;
-    }
- 
-    // 目前估計的 bbox (中心點格式)
-    CxCyWH currentBox() const {
-        return { x_(0, 0), x_(1, 0), x_(2, 0), x_(3, 0) };
-    }
-    // 目前估計的速度 [vx, vy, vw, vh]
-    void velocity(double& vx, double& vy, double& vw, double& vh) const {
-        vx = x_(4, 0); vy = x_(5, 0); vw = x_(6, 0); vh = x_(7, 0);
-    }
- 
-private:
-    Mat x_, P_, F_, H_, Q_, R_;
-};

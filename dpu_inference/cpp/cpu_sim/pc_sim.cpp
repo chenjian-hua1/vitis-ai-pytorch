@@ -1,4 +1,8 @@
 #include "util.h"
+#include "stream.h"
+#include "tracker.h"
+#include "drawer.h"
+
 #include <filesystem>
 #include <opencv2/opencv.hpp>
 #include <iostream>
@@ -73,7 +77,6 @@ int benchmark(
     //  2. 根據模型輸出決定後處理參數
     // ─────────────────────────────────────────────────────────────
     const int ch = 16;
-
     {
         cv::Mat dummy = cv::Mat::zeros(in_h, in_w, CV_32FC3);
         engine.run(dummy);
@@ -493,8 +496,8 @@ void run_camera(std::string onnx_path, int cameraIdx=0, std::string out_file = "
     // ─────────────────────────────────────────────────────────────
     //  4. Camera Setting
     // ─────────────────────────────────────────────────────────────
-    Camera::Config cfg;
-    cfg.index  = cameraIdx;
+    Camera::Config cfg{0, 640, 480, 60.0};
+    // cfg.index  = cameraIdx;
  
     Camera cam(cfg);
  
@@ -554,44 +557,10 @@ void run_camera(std::string onnx_path, int cameraIdx=0, std::string out_file = "
         bool draw_flag = true;
         cv::Mat drawn;
         if (draw_flag) {
-            const DetectionBatch& last = (*nms_result)[0];
-
-            if (last.count > 0) {
-                cv::Mat boxes_padded(last.count, 4, CV_32F);
-                for (int i = 0; i < last.count; ++i) {
-                    const Detection& d = last.data[i];
-                    float* r = boxes_padded.ptr<float>(i);
-                    r[0] = d.x1;  r[1] = d.y1;  r[2] = d.x2;  r[3] = d.y2;
-                }
-
-                cv::Mat boxes_orig = scale_boxes(
-                    boxes_padded,
-                    resize_result.ratio,
-                    resize_result.pad,
-                    cv::Size(frame.cols, frame.rows));
-
-                std::vector<Detection> dets_drawable(last.count);
-                for (int i = 0; i < last.count; ++i) {
-                    const float* r = boxes_orig.ptr<float>(i);
-                    dets_drawable[i] = Detection{
-                        r[0], r[1], r[2], r[3],
-                        last.data[i].score, last.data[i].class_id
-                    };
-                }
-
-                drawn = draw_boxes(frame, dets_drawable);
-            } else {
-                drawn = frame;
-            }
-
-            // 影片畫面疊上 FPS
-            {
-                std::ostringstream ss;
-                ss << "FPS: " << std::fixed << std::setprecision(2) << inst_fps;
-                cv::putText(drawn, ss.str(), cv::Point(10, 30),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.8,
-                            cv::Scalar(0, 255, 0), 2);
-            }
+            draw_detection(frame, drawn, (*nms_result)[0], resize_result, inst_fps);
+        }
+        else {
+            drawn = frame;
         }
         
         // ── 顯示影像 ──────────────────────────────────────────────────────

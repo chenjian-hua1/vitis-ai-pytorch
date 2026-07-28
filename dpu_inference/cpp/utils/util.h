@@ -174,8 +174,6 @@ private:
     // ── 早期過濾 ──
     float conf_thresh_cached_ = -1.f;
     std::vector<std::vector<int>>    active_indices_;
-    std::vector<std::vector<float>>  active_max_score_;
-    std::vector<std::vector<int>>    active_max_cls_;
     std::vector<std::vector<float>>  active_cls_scores_;
 
     std::vector<float> class_offsets_;
@@ -216,7 +214,8 @@ private:
 class Camera {
 public:
     struct Config {
-        int index = 0;   // 攝影機編號
+        int index = 0, width=1280, height=720;
+        double fps=30.0;   // 攝影機編號
     };
  
     explicit Camera(int index = 0);
@@ -377,21 +376,6 @@ private:
  
 
 
-
-// ============================================================================
-//  Visualization
-// ============================================================================
-
-cv::Mat scale_boxes(const cv::Mat&              boxes,
-                    std::pair<float,float>       ratio,
-                    std::pair<float,float>       pad,
-                    cv::Size                     orig_shape);
-
-cv::Mat draw_boxes(const cv::Mat&                    img,
-                   const std::vector<Detection>&     detections,
-                   const std::vector<std::string>&   class_names = {});
-
-
 #ifdef ONNX_MODE
 
 #include <onnxruntime_cxx_api.h>
@@ -492,5 +476,6 @@ private:
 
     void initialize_model_info(const std::string& xmodel_path);
 };
+
 
 #endif

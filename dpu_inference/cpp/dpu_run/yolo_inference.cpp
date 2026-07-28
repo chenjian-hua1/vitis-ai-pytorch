@@ -1,4 +1,8 @@
 #include "util.h"
+#include "tracker.h"
+#include "stream.h"
+#include "drawer.h"
+
 #include <filesystem>
 #include <opencv2/opencv.hpp>
 #include <iostream>
@@ -345,6 +349,7 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
                     << "  FPS: " << std::fixed << std::setprecision(2) << inst_fps
                     << std::flush;
 
+            
             // ─── 繪圖  ─────────────────────────────────────────────────────
             if (save_video && writer.isOpened()) {
                 const DetectionBatch& last = (*nms_result)[0];
@@ -405,8 +410,11 @@ void run_video(std::string xmodel_path, std::string video_path, std::string out_
 }
 
 
-void run_camera(std::string xmodel_path, int cameraIdx=0, std::string out_file = "",
-               double conf_th = 0.1, double iou_th = 0.45) {
+void run_camera(std::string xmodel_path, Camera::Config cam_conf,
+                double conf_th = 0.1, double iou_th = 0.45,
+                std::string out_file = "", bool draw=true,
+                bool stream=true, stream_params stream_param={}
+                ) {
     std::signal(SIGINT, signalHandler);
 
     // ─────────────────────────────────────────────────────────────
@@ -449,10 +457,7 @@ void run_camera(std::string xmodel_path, int cameraIdx=0, std::string out_file =
     // ─────────────────────────────────────────────────────────────
     //  2. Camera Setting
     // ─────────────────────────────────────────────────────────────
-    Camera::Config cfg;
-    cfg.index  = cameraIdx;
- 
-    Camera cam(cfg);
+    Camera cam(cam_conf);
  
     if (!cam.open()) {
         return ;
@@ -464,9 +469,22 @@ void run_camera(std::string xmodel_path, int cameraIdx=0, std::string out_file =
     std::cout << "按 Ctrl+C 停止擷取" << std::endl;
 
     // ─────────────────────────────────────────────────────────────
-    //  3. 讀取 Frame 進行推理
+    //  3. Video Streamer Setting
     // ─────────────────────────────────────────────────────────────
-    cv::Mat frame;
+    RtpJpegStreamer *streamer;
+    if (stream) {
+        streamer = new RtpJpegStreamer(stream_param.width, stream_param.height, stream_param.fps, stream_param.ip, stream_param.port, stream_param.quality);
+        if (!streamer->isOpened()) {
+            std::cerr << "錯誤：無法開啟 GStreamer 發送管線" << std::endl;
+            return ;
+        }
+        std::cout << "串流成功：已開啟 GStreamer 發送管線" << std::endl;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    //  4. 讀取 Frame 進行推理
+    // ─────────────────────────────────────────────────────────────
+    cv::Mat frame, drawn;;
     long long frameCount = 0;
     long long lastFrameId = -1, curFrameId = -1;
  
@@ -476,6 +494,11 @@ void run_camera(std::string xmodel_path, int cameraIdx=0, std::string out_file =
     // 分段耗時統計
     double sum_wait_ms  = 0;  // 等待新幀的時間
     double sum_infer_ms = 0;  // 推理 pipeline 耗時
+
+    double t_inf1 = 0;
+    double t_now = 0;
+    double dt_ms = 0;
+    double inst_fps = 0;
 
     while (g_running)
     {
@@ -494,7 +517,9 @@ void run_camera(std::string xmodel_path, int cameraIdx=0, std::string out_file =
         // ─── 逐 frame 推理 ───────────────────────────────────────────────
         double t_inf0 = time_now();
         resize(frame, in_w, resize_result);
-        norm_and_fix(frame, in_fix_point, dpu_input);
+        cv::cvtColor(resize_result.img, resize_result.img, cv::COLOR_BGR2RGB);
+        norm_and_fix(resize_result.img, in_fix_point, dpu_input);
+
         engine.run();
 
         for (size_t out_idx = 0; out_idx < engine.num_outputs(); ++out_idx) {
@@ -506,16 +531,16 @@ void run_camera(std::string xmodel_path, int cameraIdx=0, std::string out_file =
         nms_result = &yolo_pp.process(float_outputs, conf_th, iou_th);
  
         // ─── 時間計數  ──────────────────────────────────────────────────
-        double t_inf1 = time_now();
+        t_inf1 = time_now();
 
         sum_wait_ms  += (t_wait1 - t_wait0);
         sum_infer_ms += (t_inf1 - t_inf0);
         ++frameCount;
  
         if (frameCount % 30 == 0) {
-            double t_now  = time_now();
-            double dt_ms  = t_now - t_prev;
-            double inst_fps = (frameCount - prev_idx) * 1000.0 / dt_ms;
+            t_now  = time_now();
+            dt_ms  = t_now - t_prev;
+            inst_fps = (frameCount - prev_idx) * 1000.0 / dt_ms;
             t_prev   = t_now;
             prev_idx = frameCount;
  
@@ -532,11 +557,58 @@ void run_camera(std::string xmodel_path, int cameraIdx=0, std::string out_file =
             sum_wait_ms  = 0;
             sum_infer_ms = 0;
         }
+
+        // ─── 繪製辨識box  ───────────────────────────────────────────────
+        if (draw) {
+            // const DetectionBatch& last = (*nms_result)[0];
+
+            // if (last.count > 0) {
+            //     cv::Mat boxes_padded(last.count, 4, CV_32F);
+            //     for (int i = 0; i < last.count; ++i) {
+            //         const Detection& d = last.data[i];
+            //         float* r = boxes_padded.ptr<float>(i);
+            //         r[0] = d.x1;  r[1] = d.y1;  r[2] = d.x2;  r[3] = d.y2;
+            //     }
+
+            //     cv::Mat boxes_orig = scale_boxes(
+            //         boxes_padded, resize_result.ratio, resize_result.pad,
+            //         cv::Size(frame.cols, frame.rows));
+
+            //     std::vector<Detection> dets_drawable(last.count);
+            //     for (int i = 0; i < last.count; ++i) {
+            //         const float* r = boxes_orig.ptr<float>(i);
+            //         dets_drawable[i] = Detection{
+            //             r[0], r[1], r[2], r[3],
+            //             last.data[i].score, last.data[i].class_id
+            //         };
+            //     }
+
+            //     drawn = draw_boxes(frame, dets_drawable);
+            // } else {
+            //     drawn = frame;
+            // }
+
+            // std::ostringstream ss;
+            // ss << "FPS: " << std::fixed << std::setprecision(2) << inst_fps;
+            // cv::putText(drawn, ss.str(), cv::Point(10, 30),
+            //             cv::FONT_HERSHEY_SIMPLEX, 0.8,
+            //             cv::Scalar(0, 255, 0), 2);
+
+            draw_detection(frame, drawn, (*nms_result)[0], resize_result, inst_fps);
+        }
+        else {
+            drawn = frame;
+        }
+
+        // ─── 將影像串流到電腦  ──────────────────────────────────────────────
+        if (stream)
+            streamer->send(drawn);
     }
 
     // ── 關閉攝影機 ─────────────────────────────────────────────────────────
     cam.close();
     grabber.stop();
+    streamer->close();
     std::cout << "共擷取 " << frameCount << " 幀，程式結束。" << std::endl;
 }
 
@@ -622,7 +694,7 @@ int main(int argc, char** argv) {
 
     const int   ITER   = 1000;
     const int   WARMUP = 10;
-    const float CONF   = 0.1f;
+    const float CONF   = 0.4f;
     const float IOU    = 0.45f;
 
     // switch (args.task) {
@@ -651,7 +723,10 @@ int main(int argc, char** argv) {
     //     }
     // }
 
-    run_camera(args.model_path, 0, "", CONF, IOU);
+    stream_params stream_param{"192.168.1.100", 5000, 640, 480, 30.0, 40};
+    Camera::Config cam_conf{0, 640, 480, 60.0};
+
+    run_camera(args.model_path, cam_conf, CONF, IOU, "", true, true, stream_param);
 
     return 0;
 }

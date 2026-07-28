@@ -34,10 +34,11 @@ if [[ "$IS_CROSS" == "1" ]]; then
     # ============================================================
     # 🔥 全部寫死，不靠環境變數
     # ============================================================
-    PETALINUX_ROOT="/opt/petalinux/2022.2"
+    PETALINUX_ROOT="/home/jianhua/petalinux/cross_compile"
     SYSROOT="$PETALINUX_ROOT/sysroots/cortexa72-cortexa53-xilinx-linux"
     HOST_TOOLS="$PETALINUX_ROOT/sysroots/x86_64-petalinux-linux"
     COMPILER="$HOST_TOOLS/usr/bin/aarch64-xilinx-linux/aarch64-xilinx-linux-g++"
+    # COMPILER = ${CXX}
 
     # ---- 基本檢查 ----
     if [ ! -x "$COMPILER" ]; then
@@ -222,11 +223,11 @@ if command -v file >/dev/null 2>&1; then
 fi
 
 # ===== 顯示 binary 依賴的 .so (debug 用) =====
-if [[ "$IS_CROSS" == "1" ]] && command -v "$HOST_TOOLS/usr/bin/aarch64-xilinx-linux/aarch64-xilinx-linux-readelf" >/dev/null 2>&1; then
-    echo ""
-    echo "────────── NEEDED libraries (檢查板子上要有的 .so) ──────────"
-    "$HOST_TOOLS/usr/bin/aarch64-xilinx-linux/aarch64-xilinx-linux-readelf" -d "$OUT_FILE" | grep NEEDED || true
-fi
+# if [[ "$IS_CROSS" == "1" ]] && command -v "$HOST_TOOLS/usr/bin/aarch64-xilinx-linux/aarch64-xilinx-linux-readelf" >/dev/null 2>&1; then
+#    echo ""
+#    echo "────────── NEEDED libraries (檢查板子上要有的 .so) ──────────"
+#    "$HOST_TOOLS/usr/bin/aarch64-xilinx-linux/aarch64-xilinx-linux-readelf" -d "$OUT_FILE" | grep NEEDED || true
+# fi
 
 if [ "$VERBOSE" = "1" ]; then
     echo ""
