@@ -1,7 +1,10 @@
-#include "util.h"
+#include "modelrunner.h"
 #include "tracker.h"
 #include "stream.h"
 #include "drawer.h"
+#include "yolopproc.h"
+#include "camera.h"
+#include "preproc.h"
 
 #include <filesystem>
 #include <opencv2/opencv.hpp>
@@ -482,7 +485,15 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
     }
 
     // ─────────────────────────────────────────────────────────────
-    //  4. 讀取 Frame 進行推理
+    //  4. Tracking Setting
+    // ─────────────────────────────────────────────────────────────
+    bytetrack::Params p;
+    p.max_lost_seconds = 2.;
+    p.class_aware  = true;   // 只讓同 class 配對
+    bytetrack::BYTETracker tracker(p);
+
+    // ─────────────────────────────────────────────────────────────
+    //  5. 讀取 Frame 進行推理
     // ─────────────────────────────────────────────────────────────
     cv::Mat frame, drawn;;
     long long frameCount = 0;
@@ -514,6 +525,9 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
         lastFrameId = curFrameId;
         double t_wait1 = time_now();
 
+        const double t_cap = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
         // ─── 逐 frame 推理 ───────────────────────────────────────────────
         double t_inf0 = time_now();
         resize(frame, in_w, resize_result);
@@ -522,13 +536,21 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
 
         engine.run();
 
+        // All Feature Map 
         for (size_t out_idx = 0; out_idx < engine.num_outputs(); ++out_idx) {
             fix2float(engine.output_mat_nchw(out_idx),
                         out_fix_points[out_idx],
                         float_outputs[out_idx]);
         }
 
+
+        // ─── 後處理 ───────────────────────────────────────────────
         nms_result = &yolo_pp.process(float_outputs, conf_th, iou_th);
+
+        // ─── Track ──────────────────────────────────────────────────────
+        auto boxes = scale_detections((*nms_result)[0], resize_result,
+                              cv::Size(frame.cols, frame.rows));
+        const auto& tracks = tracker.update(boxes, t_cap);
  
         // ─── 時間計數  ──────────────────────────────────────────────────
         t_inf1 = time_now();
@@ -560,41 +582,8 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
 
         // ─── 繪製辨識box  ───────────────────────────────────────────────
         if (draw) {
-            // const DetectionBatch& last = (*nms_result)[0];
-
-            // if (last.count > 0) {
-            //     cv::Mat boxes_padded(last.count, 4, CV_32F);
-            //     for (int i = 0; i < last.count; ++i) {
-            //         const Detection& d = last.data[i];
-            //         float* r = boxes_padded.ptr<float>(i);
-            //         r[0] = d.x1;  r[1] = d.y1;  r[2] = d.x2;  r[3] = d.y2;
-            //     }
-
-            //     cv::Mat boxes_orig = scale_boxes(
-            //         boxes_padded, resize_result.ratio, resize_result.pad,
-            //         cv::Size(frame.cols, frame.rows));
-
-            //     std::vector<Detection> dets_drawable(last.count);
-            //     for (int i = 0; i < last.count; ++i) {
-            //         const float* r = boxes_orig.ptr<float>(i);
-            //         dets_drawable[i] = Detection{
-            //             r[0], r[1], r[2], r[3],
-            //             last.data[i].score, last.data[i].class_id
-            //         };
-            //     }
-
-            //     drawn = draw_boxes(frame, dets_drawable);
-            // } else {
-            //     drawn = frame;
-            // }
-
-            // std::ostringstream ss;
-            // ss << "FPS: " << std::fixed << std::setprecision(2) << inst_fps;
-            // cv::putText(drawn, ss.str(), cv::Point(10, 30),
-            //             cv::FONT_HERSHEY_SIMPLEX, 0.8,
-            //             cv::Scalar(0, 255, 0), 2);
-
-            draw_detection(frame, drawn, (*nms_result)[0], resize_result, inst_fps);
+            // draw_detection(frame, drawn, (*nms_result)[0], resize_result, inst_fps);
+            draw_tracking(frame, drawn, tracks, inst_fps);
         }
         else {
             drawn = frame;
@@ -680,7 +669,7 @@ static bool parse_args(int argc, char** argv, CliArgs& out) {
         ? positional[1]
         : "model/YOLO_int.xmodel";
     out.out_path   = (positional.size() > 2) ? positional[2] : "";
-
+ 
     return true;
 }
 

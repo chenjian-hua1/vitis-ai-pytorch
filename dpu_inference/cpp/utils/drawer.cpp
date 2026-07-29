@@ -113,3 +113,99 @@ void draw_detection(const cv::Mat& in, cv::Mat& out, const DetectionBatch& detec
                 cv::FONT_HERSHEY_SIMPLEX, 0.8,
                 cv::Scalar(0, 255, 0), 2);
 }
+
+// ============================================================================
+//  Tracking 繪圖
+// ============================================================================
+
+std::vector<bytetrack::Box> scale_detections(const DetectionBatch& detections,
+                                             const ResizeResult&   resize_inf,
+                                             cv::Size              orig_shape)
+{
+    std::vector<bytetrack::Box> boxes;
+    if (detections.count <= 0) return boxes;
+    boxes.reserve(static_cast<size_t>(detections.count));
+
+    const float inv_rx = 1.f / resize_inf.ratio.first;
+    const float inv_ry = 1.f / resize_inf.ratio.second;
+    const float dw     = resize_inf.pad.first;
+    const float dh     = resize_inf.pad.second;
+    const float w_max  = static_cast<float>(orig_shape.width);
+    const float h_max  = static_cast<float>(orig_shape.height);
+
+    for (int i = 0; i < detections.count; ++i) {
+        const Detection& d = detections.data[i];
+        bytetrack::Box b;
+        b.x1    = std::clamp((d.x1 - dw) * inv_rx, 0.f, w_max);
+        b.y1    = std::clamp((d.y1 - dh) * inv_ry, 0.f, h_max);
+        b.x2    = std::clamp((d.x2 - dw) * inv_rx, 0.f, w_max);
+        b.y2    = std::clamp((d.y2 - dh) * inv_ry, 0.f, h_max);
+        b.score = d.score;
+        b.cls   = d.class_id;
+        boxes.push_back(b);
+    }
+    return boxes;
+}
+
+
+cv::Mat draw_tracks(const cv::Mat&                       img,
+                    const std::vector<bytetrack::Track>& tracks,
+                    const std::vector<std::string>&      class_names)
+{
+    cv::Mat out = img.clone();
+
+    for (const bytetrack::Track& t : tracks) {
+        int x1 = static_cast<int>(t.x1), y1 = static_cast<int>(t.y1);
+        int x2 = static_cast<int>(t.x2), y2 = static_cast<int>(t.y2);
+
+        // 顏色以 track_id 為基準,同一個目標整段影片顏色固定
+        int id = t.track_id;
+        cv::Scalar color(
+            (id * 67  + 100) % 255,
+            (id * 113 +  50) % 255,
+            (id * 179 + 150) % 255
+        );
+
+        cv::rectangle(out, cv::Point(x1, y1), cv::Point(x2, y2), color, 2);
+
+        std::string cname = (class_names.size() > static_cast<size_t>(t.cls))
+            ? class_names[t.cls]
+            : "Class " + std::to_string(t.cls);
+
+        std::string label = "ID" + std::to_string(id) + " " + cname +
+                            ": " + std::to_string(t.score).substr(0, 4);
+
+        int      baseline = 0;
+        cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX,
+                                       0.5, 1, &baseline);
+
+        // 框貼在畫面頂端時,標籤翻到框內側,避免被裁掉
+        int label_top = (y1 - ts.height - 6 >= 0) ? y1 - ts.height - 6 : y1;
+        cv::rectangle(out,
+                       cv::Point(x1, label_top),
+                       cv::Point(x1 + ts.width, label_top + ts.height + 6),
+                       color, cv::FILLED);
+
+        cv::putText(out, label, cv::Point(x1, label_top + ts.height + 1),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                    cv::Scalar(255, 255, 255), 1);
+    }
+
+    return out;
+}
+
+
+void draw_tracking(const cv::Mat&                       in,
+                   cv::Mat&                             out,
+                   const std::vector<bytetrack::Track>& tracks,
+                   double                               fps)
+{
+    out = tracks.empty() ? in : draw_tracks(in, tracks);
+
+    std::ostringstream ss;
+    ss << "FPS: " << std::fixed << std::setprecision(2) << fps
+       << "   Tracks: " << tracks.size();
+    cv::putText(out, ss.str(), cv::Point(10, 30),
+                cv::FONT_HERSHEY_SIMPLEX, 0.8,
+                cv::Scalar(0, 255, 0), 2);
+}

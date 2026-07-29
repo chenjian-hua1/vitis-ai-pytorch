@@ -1,7 +1,10 @@
-#include "util.h"
-#include "stream.h"
+#include "modelrunner.h"
 #include "tracker.h"
+#include "stream.h"
 #include "drawer.h"
+#include "yolopproc.h"
+#include "camera.h"
+#include "preproc.h"
 
 #include <filesystem>
 #include <opencv2/opencv.hpp>
@@ -507,8 +510,18 @@ void run_camera(std::string onnx_path, int cameraIdx=0, std::string out_file = "
  
     std::cout << "按 Ctrl+C 停止擷取" << std::endl;
 
+
     // ─────────────────────────────────────────────────────────────
-    //  5. 主迴圈 : 讀 frame 進行推理
+    //  5. Tracking Setting
+    // ─────────────────────────────────────────────────────────────
+    bytetrack::Params p;
+    p.max_lost_seconds = 2.;
+    p.class_aware  = true;   // 只讓同 class 配對
+    bytetrack::BYTETracker tracker(p);
+
+
+    // ─────────────────────────────────────────────────────────────
+    //  6. 主迴圈 : 讀 frame 進行推理
     // ─────────────────────────────────────────────────────────────
     cv::Mat frame, rgb_frame;
     long long frameCount = 0;
@@ -524,6 +537,9 @@ void run_camera(std::string onnx_path, int cameraIdx=0, std::string out_file = "
             break;
         }
 
+        const double t_cap = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
         // ── 前處理 ──────────────────────────────────────────────────────
         cv::cvtColor(frame, rgb_frame, cv::COLOR_BGR2RGB);
         resize(rgb_frame, in_w, resize_result);
@@ -534,6 +550,11 @@ void run_camera(std::string onnx_path, int cameraIdx=0, std::string out_file = "
 
         // ── 後處理 ──────────────────────────────────────────────────────
         nms_result = &yolo_pp.process(engine.output_mats(), conf_th, iou_th);
+
+        // ── Track ──────────────────────────────────────────────────────
+        auto boxes = scale_detections((*nms_result)[0], resize_result,
+                              cv::Size(frame.cols, frame.rows));
+        const auto& tracks = tracker.update(boxes, t_cap);
 
         // ── 計數 ──────────────────────────────────────────────────────
         ++frameCount;
@@ -557,7 +578,8 @@ void run_camera(std::string onnx_path, int cameraIdx=0, std::string out_file = "
         bool draw_flag = true;
         cv::Mat drawn;
         if (draw_flag) {
-            draw_detection(frame, drawn, (*nms_result)[0], resize_result, inst_fps);
+            // draw_detection(frame, drawn, (*nms_result)[0], resize_result, inst_fps);
+            draw_tracking(frame, drawn, tracks, inst_fps);
         }
         else {
             drawn = frame;
