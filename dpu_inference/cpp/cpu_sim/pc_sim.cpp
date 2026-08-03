@@ -519,6 +519,8 @@ void run_camera(std::string onnx_path, int cameraIdx=0, std::string out_file = "
     p.class_aware  = true;   // 只讓同 class 配對
     bytetrack::BYTETracker tracker(p);
 
+    std::vector<bytetrack::Box> boxes;
+
 
     // ─────────────────────────────────────────────────────────────
     //  6. 主迴圈 : 讀 frame 進行推理
@@ -552,9 +554,9 @@ void run_camera(std::string onnx_path, int cameraIdx=0, std::string out_file = "
         nms_result = &yolo_pp.process(engine.output_mats(), conf_th, iou_th);
 
         // ── Track ──────────────────────────────────────────────────────
-        auto boxes = scale_detections((*nms_result)[0], resize_result,
-                              cv::Size(frame.cols, frame.rows));
-        const auto& tracks = tracker.update(boxes, t_cap);
+        scale_detections((*nms_result)[0], boxes, resize_result, 
+                                                cv::Size(frame.cols, frame.rows));
+        const std::vector<bytetrack::Track>& tracks = tracker.update(boxes, t_cap);
 
         // ── 計數 ──────────────────────────────────────────────────────
         ++frameCount;
@@ -620,8 +622,8 @@ int main(int argc, char** argv) {
     const int WARMUP = 10;
 
     // conf / iou 集中在這裡，decode 跟 nms 必須用相同 conf
-    const float CONF = 0.5f;
-    const float IOU  = 0.45f;
+    const float CONF = 0.2f;
+    const float IOU  = 0.5f;
 
     // // return benchmark(img_path, model_path, 1000, 10, CONF, IOU);
     // // run_camera(model_path);

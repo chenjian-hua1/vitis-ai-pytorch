@@ -118,13 +118,14 @@ void draw_detection(const cv::Mat& in, cv::Mat& out, const DetectionBatch& detec
 //  Tracking 繪圖
 // ============================================================================
 
-std::vector<bytetrack::Box> scale_detections(const DetectionBatch& detections,
-                                             const ResizeResult&   resize_inf,
-                                             cv::Size              orig_shape)
+void scale_detections(const DetectionBatch& detections,
+                      std::vector<bytetrack::Box> &out_boxes,
+                      const ResizeResult&   resize_inf,
+                      cv::Size              orig_shape)
 {
-    std::vector<bytetrack::Box> boxes;
-    if (detections.count <= 0) return boxes;
-    boxes.reserve(static_cast<size_t>(detections.count));
+    out_boxes.clear();                       // 先清空，避免提前 return 時殘留舊資料
+    if (detections.count <= 0) return ;
+    out_boxes.reserve(static_cast<size_t>(detections.count));
 
     const float inv_rx = 1.f / resize_inf.ratio.first;
     const float inv_ry = 1.f / resize_inf.ratio.second;
@@ -142,9 +143,8 @@ std::vector<bytetrack::Box> scale_detections(const DetectionBatch& detections,
         b.y2    = std::clamp((d.y2 - dh) * inv_ry, 0.f, h_max);
         b.score = d.score;
         b.cls   = d.class_id;
-        boxes.push_back(b);
+        out_boxes.push_back(b);
     }
-    return boxes;
 }
 
 

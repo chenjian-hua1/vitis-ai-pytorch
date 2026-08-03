@@ -492,6 +492,8 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
     p.class_aware  = true;   // 只讓同 class 配對
     bytetrack::BYTETracker tracker(p);
 
+    std::vector<bytetrack::Box> boxes;
+
     // ─────────────────────────────────────────────────────────────
     //  5. 讀取 Frame 進行推理
     // ─────────────────────────────────────────────────────────────
@@ -525,8 +527,7 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
         lastFrameId = curFrameId;
         double t_wait1 = time_now();
 
-        const double t_cap = std::chrono::duration<double>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+        const double t_cap = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 
         // ─── 逐 frame 推理 ───────────────────────────────────────────────
         double t_inf0 = time_now();
@@ -548,9 +549,8 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
         nms_result = &yolo_pp.process(float_outputs, conf_th, iou_th);
 
         // ─── Track ──────────────────────────────────────────────────────
-        auto boxes = scale_detections((*nms_result)[0], resize_result,
-                              cv::Size(frame.cols, frame.rows));
-        const auto& tracks = tracker.update(boxes, t_cap);
+        scale_detections((*nms_result)[0], boxes, resize_result, cv::Size(frame.cols, frame.rows));
+        const std::vector<bytetrack::Track>& tracks = tracker.update(boxes, t_cap);
  
         // ─── 時間計數  ──────────────────────────────────────────────────
         t_inf1 = time_now();
@@ -683,34 +683,8 @@ int main(int argc, char** argv) {
 
     const int   ITER   = 1000;
     const int   WARMUP = 10;
-    const float CONF   = 0.4f;
-    const float IOU    = 0.45f;
-
-    // switch (args.task) {
-    //     case Task::Benchmark: {
-    //         cv::Mat img = cv::imread(args.input_path);
-    //         if (img.empty()) {
-    //             std::cerr << "無法開啟影像: " << args.input_path << "\n";
-    //             return -1;
-    //         }
-    //         std::cout << "[Task] benchmark\n";
-    //         std::cout << "  input: " << args.input_path << "\n";
-    //         std::cout << "  model: " << args.model_path << "\n";
-    //         benchmark(args.model_path, img, WARMUP, ITER, CONF, IOU);
-    //         break;
-    //     }
-    //     case Task::Video: {
-    //         std::cout << "[Task] video\n";
-    //         std::cout << "  input: " << args.input_path << "\n";
-    //         std::cout << "  model: " << args.model_path << "\n";
-    //         if (!args.out_path.empty())
-    //             std::cout << "  out  : " << args.out_path << "\n";
-    //         else
-    //             std::cout << "  out  : (不寫出)\n";
-    //         run_video(args.model_path, args.input_path, args.out_path, CONF, IOU);
-    //         break;
-    //     }
-    // }
+    const float CONF   = 0.2f;
+    const float IOU    = 0.5f;
 
     stream_params stream_param{"192.168.1.100", 5000, 640, 480, 30.0, 40};
     Camera::Config cam_conf{0, 640, 480, 60.0};

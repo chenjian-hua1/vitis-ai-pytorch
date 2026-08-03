@@ -14,9 +14,10 @@ cv::Mat draw_boxes(const cv::Mat&                    img,
 void draw_detection(const cv::Mat& in, cv::Mat& out, const DetectionBatch& detections, const ResizeResult& resize_inf, double fps=0);
 
 // letterbox 座標 → 原圖座標，並轉成 tracker 的輸入格式
-std::vector<bytetrack::Box> scale_detections(const DetectionBatch& detections,
-                                            const ResizeResult&   resize_inf,
-                                            cv::Size              orig_shape);
+void scale_detections(const DetectionBatch& detections,
+                      std::vector<bytetrack::Box> &out_boxes,
+                      const ResizeResult&   resize_inf,
+                      cv::Size              orig_shape);
 
 cv::Mat draw_tracks(const cv::Mat&                     img,
                     const std::vector<bytetrack::Track>& tracks,
