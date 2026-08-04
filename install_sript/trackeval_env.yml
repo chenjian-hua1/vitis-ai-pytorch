@@ -1,0 +1,47 @@
+# =============================================================================
+# eval_cpp.ipynb 用的評測環境（TrackEval + pycocotools）
+#
+#   conda env create -f environment.yml
+#   conda activate mot-eval
+#   python -m ipykernel install --user --name mot-eval --display-name "Python (mot-eval)"
+#
+# ★ numpy 鎖在 1.26.x 是刻意的：
+#   numpy 2.0 移除了 np.Inf / np.NaN / np.asfarray 等別名，
+#   TrackEval 和舊版 scipy 會直接 ImportError；
+#   pycocotools 是編譯型套件，對著 numpy 1.x 編的話在 numpy 2.x 下會噴 ABI 錯誤。
+#   整條 pipeline 沒有任何地方需要 numpy 2 的新功能，鎖 1.26 最省事。
+# =============================================================================
+name: mot-eval
+
+channels:
+  - conda-forge
+
+dependencies:
+  # ── 直譯器 ────────────────────────────────────────────────────────────
+  - python=3.10
+
+  # ── 核心數值套件（版本互相咬合，不要單獨升級 numpy）──────────────────
+  - numpy=1.26.4          # < 2.0，理由見檔頭
+  - scipy=1.11.4          # TrackEval 的 linear_sum_assignment
+  - pandas=2.1.4          # notebook 最後的指標表格
+
+  # ── 評測 ──────────────────────────────────────────────────────────────
+  - pycocotools=2.0.7     # mAP；用 conda-forge 的預編版本，免自己編譯
+  - pyyaml=6.*            # 讀 data.yaml
+  - tqdm=4.*              # C++ 執行進度條
+
+  # ── Notebook ──────────────────────────────────────────────────────────
+  - ipykernel
+  - jupyterlab            # 只用 VS Code 開的話可以刪掉
+
+  # ── 其他 ──────────────────────────────────────────────────────────────
+  - matplotlib-base       # TrackEval 畫 PR 曲線用（我們預設關閉，留著備用）
+  - git                   # 下面 pip 要從 GitHub 裝 TrackEval
+  - pip
+
+  - pip:
+      # TrackEval 官方版（PyPI 上的 trackeval 0.1.5 是舊 fork，相容性較差）
+      - git+https://github.com/JonathonLuiten/TrackEval.git
+
+      # 沒網路 / 公司內網擋 GitHub 的話，改用這行（記得先註解掉上面那行）：
+      # - trackeval==0.1.5
