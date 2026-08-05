@@ -1,10 +1,10 @@
-path: /home/jianhua/Desktop/dataset/SeaDronesSee_MOT
+path: /home/jianhua/Desktop/dataset/SeaDronesSee_MOT # 資料集路徑
 
-train: images/train
-val: images/val
+train: images/train # train 子集的路徑 <path>/<train>
+val: images/val     # val 資集的路徑   <path>/<val>
 
-nc: 4
-names:
+nc: 4  # 類別數
+names: # ID 類別名
   0: swimmer
   1: swimmer_with_life_jacket
   2: boat

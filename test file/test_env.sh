@@ -9,7 +9,7 @@ DATA_DIR="dataset/tiny-imagenet-200/"
 PRETRAINED_MODEL="model/resnet18.pth"
 MODEL_DIR="model"
 XMODEL_PATH="quantize_result/ResNet_int.xmodel"
-BOARD="/compiler/arch/DPUCZDX8G/KV260"
+BOARD="../dpu_arch/DPUCZDX8G/KV260"
 OUTPUT_PATH="kv26_dpu"
 NETNAME="kv26_resnet18"
 
