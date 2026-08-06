@@ -5,6 +5,7 @@
 #include "yolopproc.h"
 #include "camera.h"
 #include "preproc.h"
+#include "cli_args.h"
 
 #include <filesystem>
 #include <opencv2/opencv.hpp>
@@ -602,78 +603,6 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
 }
 
 
-// ============================================================================
-//  CLI 解析
-// ============================================================================
-//
-//  用法：
-//    ./prog [--task=benchmark|video]  <input_path>  <model_path>  [out_path]
-//
-//    --task 可放在 argv 任何位置；未指定時預設 benchmark。
-//    out_path 僅 video 任務有意義；不給則不寫出。
-//
-//  範例：
-//    ./prog 2308.jpg model/YOLO_int.xmodel
-//    ./prog --task=benchmark 2308.jpg model/YOLO_int.xmodel
-//    ./prog --task=video video.mp4 model/YOLO_int.xmodel
-//    ./prog --task=video video.mp4 model/YOLO_int.xmodel pred.mp4
-//
-
-enum class Task { Benchmark, Video };
-
-struct CliArgs {
-    Task        task = Task::Benchmark;
-    std::string input_path;
-    std::string model_path;
-    std::string out_path;
-};
-
-static void print_usage(const char* prog) {
-    std::cerr <<
-        "Usage:\n"
-        "  " << prog << " [--task=benchmark|video] <input_path> <model_path> [out_path]\n"
-        "\n"
-        "  --task        benchmark (default) | video\n"
-        "  input_path    image (benchmark) 或 video (video task)\n"
-        "  model_path    xmodel 路徑\n"
-        "  out_path      video 任務的輸出檔，省略則不寫出\n";
-}
-
-static bool parse_args(int argc, char** argv, CliArgs& out) {
-    std::vector<std::string> positional;
-    positional.reserve(argc);
-
-    for (int i = 1; i < argc; ++i) {
-        const char* a = argv[i];
-        if (std::strncmp(a, "--task=", 7) == 0) {
-            std::string val(a + 7);
-            std::transform(val.begin(), val.end(), val.begin(),
-                           [](unsigned char c){ return std::tolower(c); });
-            if      (val == "benchmark") out.task = Task::Benchmark;
-            else if (val == "video")     out.task = Task::Video;
-            else {
-                std::cerr << "未知的 --task 值: " << val << "\n";
-                return false;
-            }
-        } else if (std::strcmp(a, "--help") == 0 || std::strcmp(a, "-h") == 0) {
-            return false;
-        } else {
-            positional.emplace_back(a);
-        }
-    }
-
-    out.input_path = (positional.size() > 0)
-        ? positional[0]
-        : "/home/jianhua/Desktop/vitis-ai-pytorch/dpu_inference/2308.jpg";
-    out.model_path = (positional.size() > 1)
-        ? positional[1]
-        : "model/YOLO_int.xmodel";
-    out.out_path   = (positional.size() > 2) ? positional[2] : "";
- 
-    return true;
-}
-
-
 int main(int argc, char** argv) {
     CliArgs args;
     if (!parse_args(argc, argv, args)) {
@@ -681,15 +610,10 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    const int   ITER   = 1000;
-    const int   WARMUP = 10;
-    const float CONF   = 0.2f;
-    const float IOU    = 0.5f;
+    stream_params stream_param{args.st_ip, args.st_port, args.st_width, args.st_height, args.st_fps, args.st_quality};
+    Camera::Config cam_cfg{args.cam_index, args.cam_width, args.cam_height, args.cam_fps};
 
-    stream_params stream_param{"192.168.1.100", 5000, 640, 480, 30.0, 40};
-    Camera::Config cam_conf{0, 640, 480, 60.0};
-
-    run_camera(args.model_path, cam_conf, CONF, IOU, "", true, true, stream_param);
+    run_camera(args.model_path, cam_cfg, args.conf, args.iou, "", args.draw, args.stream, stream_param);
 
     return 0;
 }

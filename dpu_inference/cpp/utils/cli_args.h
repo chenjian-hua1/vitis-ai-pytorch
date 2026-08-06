@@ -38,7 +38,7 @@ struct CliArgs {
     int    st_width    = 640;
     int    st_height   = 480;
     double st_fps      = 30.0;
-    int    st_quality  = 40;
+    int    st_quality  = 60;
 
     // 輸出
     std::string save   = "benchmark_last_frame.jpg";

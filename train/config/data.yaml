@@ -1,4 +1,4 @@
-path: /home/jianhua/Desktop/dataset/SeaDronesSee_MOT # 資料集路徑
+path: /media/jianhua/HDD 1T/dataset/SeaDronesSee_MOT # 資料集路徑
 
 train: images/train # train 子集的路徑 <path>/<train>
 val: images/val     # val 資集的路徑   <path>/<val>
