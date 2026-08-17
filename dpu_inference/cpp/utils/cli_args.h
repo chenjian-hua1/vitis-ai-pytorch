@@ -4,6 +4,7 @@
 // ============================================================================
 #pragma once
 
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -17,16 +18,18 @@ struct CliArgs {
     // 必要
     std::string model_path;
 
-    // Camera: {index, width, height, fps}
+    // Camera: {index, width, height, fps, fourcc}
     int    cam_index   = 0;
-    int    cam_width   = 640;
-    int    cam_height  = 480;
+    int    cam_width   = 1920; // 640
+    int    cam_height  = 1080; // 480
     double cam_fps     = 60.0;
+    // MJPG / YUYV / UYVY / H264
+    std::string cam_fourcc = "UYVY";   // 空字串 = 不設定，沿用驅動預設
 
     // Benchmark
     int    warmup      = 10;
     int    iter        = 1000;
-    float  conf        = 0.2f;
+    float  conf        = 0.4f;
     float  iou         = 0.5f;
     bool   track       = true;
     bool   draw        = true;
@@ -36,7 +39,7 @@ struct CliArgs {
     std::string st_ip  = "192.168.1.100";
     int    st_port     = 5000;
     int    st_width    = 640;
-    int    st_height   = 480;
+    int    st_height   = 640;
     double st_fps      = 30.0;
     int    st_quality  = 60;
 
@@ -73,6 +76,26 @@ inline bool to_double(const std::string& s, double& out, const char* opt) {
     return true;
 }
 
+// FOURCC 必須剛好 4 個可見 ASCII 字元（例如 MJPG / YUYV / H264）。
+// 空字串代表「不主動設定」。順便統一轉成大寫。
+inline bool to_fourcc(std::string& s, const char* opt) {
+    if (s.empty()) return true;
+    if (s.size() != 4) {
+        std::cerr << "錯誤: " << opt << " 需要剛好 4 個字元（例如 MJPG、YUYV），收到 \""
+                  << s << "\"\n";
+        return false;
+    }
+    for (size_t i = 0; i < s.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 32 || c > 126) {
+            std::cerr << "錯誤: " << opt << " 只能包含可見的 ASCII 字元\n";
+            return false;
+        }
+        s[i] = static_cast<char>(std::toupper(c));
+    }
+    return true;
+}
+
 inline bool file_readable(const std::string& path) {
     std::ifstream f(path.c_str(), std::ios::binary);
     return f.good();
@@ -94,6 +117,8 @@ inline void print_usage(const char* prog) {
     << "  --cam-width   <int>      擷取寬度            (預設 " << d.cam_width  << ")\n"
     << "  --cam-height  <int>      擷取高度            (預設 " << d.cam_height << ")\n"
     << "  --cam-fps     <float>    擷取 FPS            (預設 " << d.cam_fps    << ")\n"
+    << "  --cam-fourcc  <4chars>   擷取像素格式        (預設 " << d.cam_fourcc << ")\n"
+    << "                           常見: MJPG / YUYV / H264；傳空字串 \"\" 則不設定\n"
     << "\nBenchmark:\n"
     << "  -w, --warmup  <int>      暖機幀數            (預設 " << d.warmup << ")\n"
     << "  -n, --iter    <int>      統計幀數            (預設 " << d.iter   << ")\n"
@@ -177,6 +202,10 @@ inline bool parse_args(int argc, char** argv, CliArgs& a) {
         }
         else if (key == "--cam-fps") {
             if (!next_val(v) || !to_double(v, a.cam_fps, "--cam-fps")) return false;
+        }
+        else if (key == "--cam-fourcc") {
+            if (!next_val(v) || !to_fourcc(v, "--cam-fourcc")) return false;
+            a.cam_fourcc = v;
         }
         // ── benchmark ────────────────────────────────────────────
         else if (key == "-w" || key == "--warmup") {
@@ -294,7 +323,9 @@ inline void print_args(const CliArgs& a) {
     std::cout << "----- 設定 -----\n"
               << "xmodel   : " << a.model_path << "\n"
               << "camera   : index " << a.cam_index << "  "
-              << a.cam_width << "x" << a.cam_height << " @" << a.cam_fps << "fps\n"
+              << a.cam_width << "x" << a.cam_height << " @" << a.cam_fps << "fps  "
+              << "fourcc " << (a.cam_fourcc.empty() ? "(driver default)" : a.cam_fourcc)
+              << "\n"
               << "bench    : warmup " << a.warmup << ", iter " << a.iter
               << ", conf " << a.conf << ", iou " << a.iou << "\n"
               << "stages   : track " << (a.track  ? "on" : "off")

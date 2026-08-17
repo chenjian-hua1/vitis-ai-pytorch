@@ -147,6 +147,31 @@ void scale_detections(const DetectionBatch& detections,
     }
 }
 
+void map_detections(const DetectionBatch& det,
+                    std::vector<bytetrack::Box>& out,
+                    float off_x, float off_y,   // 要扣掉的 letterbox padding
+                    float sx, float sy,         // 額外縮放(不縮就傳 1)
+                    cv::Size dst)               // 目標座標系,用來 clamp
+{
+    out.clear();
+    if (det.count <= 0) return;
+    out.reserve(static_cast<size_t>(det.count));
+
+    const float w_max = dst.width  - 1.f;
+    const float h_max = dst.height - 1.f;
+
+    for (int i = 0; i < det.count; ++i) {
+        const Detection& d = det.data[i];
+        bytetrack::Box b;
+        b.x1 = std::clamp((d.x1 - off_x) * sx, 0.f, w_max);
+        b.y1 = std::clamp((d.y1 - off_y) * sy, 0.f, h_max);
+        b.x2 = std::clamp((d.x2 - off_x) * sx, 0.f, w_max);
+        b.y2 = std::clamp((d.y2 - off_y) * sy, 0.f, h_max);
+        b.score = d.score;
+        b.cls   = d.class_id;
+        out.push_back(b);
+    }
+}
 
 cv::Mat draw_tracks(const cv::Mat&                       img,
                     const std::vector<bytetrack::Track>& tracks,

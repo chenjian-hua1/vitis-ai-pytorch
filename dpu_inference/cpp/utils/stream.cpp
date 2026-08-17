@@ -37,7 +37,7 @@ bool RtpJpegStreamer::send(const cv::Mat& frame)
     cv::Mat out = frame;
     // 尺寸不符時自動縮放，避免 pipeline 協商失敗
     if (frame.cols != width_ || frame.rows != height_) {
-        cv::resize(frame, out, cv::Size(width_, height_));
+        cv::resize(frame, out, cv::Size(width_, height_), 0, 0, cv::INTER_NEAREST);
     }
     writer_.write(out);
     return true;

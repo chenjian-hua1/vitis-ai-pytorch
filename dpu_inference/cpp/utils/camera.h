@@ -24,8 +24,11 @@
 class Camera {
 public:
     struct Config {
-        int index = 0, width=1280, height=720;
-        double fps=30.0;   // 攝影機編號
+        int    index  = 0;
+        int    width  = 640;
+        int    height = 480;
+        double fps    = 60.0;
+        std::string fourcc = "MJPG";   // 新增；空字串 = 不設定
     };
  
     explicit Camera(int index = 0);
@@ -59,6 +62,7 @@ private:
     int                m_actualWidth  = 0;
     int                m_actualHeight = 0;
     double             m_actualFps    = 0.0;
+    std::string        m_actualFourcc = "MJPG";
 };
 
 /**

@@ -100,7 +100,8 @@ class Dataset(data.Dataset):
         if r != 1:
             image = cv2.resize(image,
                                dsize=(int(w * r), int(h * r)),
-                               interpolation=resample() if self.augment else cv2.INTER_LINEAR)
+                               interpolation=resample() if self.augment else 
+                               (cv2.INTER_LINEAR if r>1 else cv2.INTER_AREA)) # Image Upscaling -> LINEAR  Downsampling -> AREA
         return image, (h, w)
 
     def load_mosaic(self, index, params):
@@ -268,7 +269,11 @@ def copy_paste(image, label, all_labels, all_filenames, input_size, n_paste=3):
         new_oh = max(4, int(obj_h * scale))
         if new_ow > w or new_oh > h:
             continue
-        obj = cv2.resize(obj, (new_ow, new_oh), interpolation=cv2.INTER_LINEAR)
+
+        if scale>1:
+            obj = cv2.resize(obj, (new_ow, new_oh), interpolation=cv2.INTER_LINEAR)
+        else:
+            obj = cv2.resize(obj, (new_ow, new_oh), interpolation=cv2.INTER_AREA)
 
         # 隨機貼上位置
         px = random.randint(0, w - new_ow)
@@ -343,7 +348,8 @@ def resize(image, input_size, augment):
     h = (input_size - pad[1]) / 2
     if shape[::-1] != pad:
         image = cv2.resize(image, dsize=pad,
-                           interpolation=resample() if augment else cv2.INTER_LINEAR)
+                           interpolation=resample() if augment else 
+                           (cv2.INTER_LINEAR if r>1 else cv2.INTER_AREA)) # Image Upscaling -> LINEAR  Downsampling -> AREA
     top, bottom = int(round(h - 0.1)), int(round(h + 0.1))
     left, right = int(round(w - 0.1)), int(round(w + 0.1))
     image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT)

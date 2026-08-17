@@ -19,6 +19,12 @@ void scale_detections(const DetectionBatch& detections,
                       const ResizeResult&   resize_inf,
                       cv::Size              orig_shape);
 
+void map_detections(const DetectionBatch& det,
+                    std::vector<bytetrack::Box>& out,
+                    float off_x, float off_y,   // 要扣掉的 letterbox padding
+                    float sx, float sy,         // 額外縮放(不縮就傳 1)
+                    cv::Size dst);               // 目標座標系,用來 clamp
+
 cv::Mat draw_tracks(const cv::Mat&                     img,
                     const std::vector<bytetrack::Track>& tracks,
                     const std::vector<std::string>&    class_names = {});

@@ -19,6 +19,7 @@ struct ResizeResult {
     cv::Mat img;
     std::pair<float,float> ratio;
     std::pair<float,float> pad;
+    cv::Rect               content;
 };
 
 struct Detection {

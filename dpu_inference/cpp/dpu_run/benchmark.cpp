@@ -17,7 +17,7 @@
 //
 
 #ifndef BENCH_DIRECT_CAPTURE
-#define BENCH_DIRECT_CAPTURE 0
+#define BENCH_DIRECT_CAPTURE 1
 #endif
 
 #include "cli_args.h"
@@ -141,7 +141,7 @@ void benchmark_camera(std::string xmodel_path,
                       bool   do_track  = true,
                       bool   draw      = false,
                       bool   stream    = false,
-                      stream_params stream_param = {},
+                      stream_params stream_param = {},   // by value，內部會覆寫 w/h
                       std::string save_last = "benchmark_last_frame.jpg")
 {
     std::signal(SIGINT, signalHandler);
@@ -177,8 +177,12 @@ void benchmark_camera(std::string xmodel_path,
     YOLOPostProcessor yolo_pp(1, in_h, in_w, nc, ch);
 
     ResizeResult resize_result;
+    cv::Mat      rgb_buf;                       // ★ 新增：DPU 專用的 RGB buffer
     std::vector<cv::Mat> float_outputs(engine.num_outputs());
     const std::vector<DetectionBatch>* nms_result = nullptr;
+
+    // ★ 方案 1：繪圖 / 串流的座標系就是 letterbox 影像本身
+    const cv::Size draw_size(in_w, in_h);
 
     cv::Mat dpu_input;
     engine.bind_input_mat(dpu_input);
@@ -204,10 +208,19 @@ void benchmark_camera(std::string xmodel_path,
 #endif
 
     // ─────────────────────────────────────────────────────────────
-    //  3. Streamer（可選，只為量測 send 的成本）
+    //  3. Streamer（★ 尺寸強制對齊 letterbox 影像）
     // ─────────────────────────────────────────────────────────────
     RtpJpegStreamer* streamer = nullptr;
     if (stream) {
+        if (stream_param.width != in_w || stream_param.height != in_h) {
+            std::cout << "[方案1] 串流尺寸由 "
+                      << stream_param.width << "x" << stream_param.height
+                      << " 覆寫為 " << in_w << "x" << in_h
+                      << "（直接送 letterbox 影像，不做額外 resize）\n";
+        }
+        stream_param.width  = in_w;
+        stream_param.height = in_h;
+
         streamer = new RtpJpegStreamer(stream_param.width, stream_param.height,
                                        stream_param.fps, stream_param.ip,
                                        stream_param.port, stream_param.quality);
@@ -239,7 +252,7 @@ void benchmark_camera(std::string xmodel_path,
     StageTimer s_deq   ("Fix2Float (dequant)");
     StageTimer s_dfl   ("DFL Decode");
     StageTimer s_nms   ("NMS");
-    StageTimer s_track ("Scale+Track");
+    StageTimer s_track ("Track (no scale)");   // ★ 已無座標還原成本
     StageTimer s_draw  ("Draw");
     StageTimer s_send  ("Stream Send");
     StageTimer s_loop  ("[Loop total]");
@@ -249,12 +262,13 @@ void benchmark_camera(std::string xmodel_path,
     int  done = 0;
     bool aborted = false;
 
+    // ★ 移到迴圈外：tracker.update() 回傳內部容器的參照，迴圈結束後仍有效
+    const std::vector<bytetrack::Track>* tracks = nullptr;
+
     // ── 取得一幀（依模式切換）──────────────────────────────────────
-    // 回傳 false 表示中止
     auto acquire = [&](double& ms) -> bool {
         double t0 = time_now();
 #if BENCH_DIRECT_CAPTURE
-        // Camera 若沒有 read()，改成你的 API（例如 cam.grab(frame) / cam.capture(frame)）
         bool ok = cam.nextFrame(frame);
         if (!ok || frame.empty()) { ms = 0; return false; }
 #else
@@ -278,8 +292,8 @@ void benchmark_camera(std::string xmodel_path,
         if (!acquire(dummy)) { aborted = true; break; }
 
         resize(frame, in_w, resize_result);
-        cv::cvtColor(resize_result.img, resize_result.img, cv::COLOR_BGR2RGB);
-        norm_and_fix(resize_result.img, in_fix_point, dpu_input);
+        cv::cvtColor(resize_result.img, rgb_buf, cv::COLOR_BGR2RGB);   // ★ 非 in-place
+        norm_and_fix(rgb_buf, in_fix_point, dpu_input);
         engine.run();
         for (size_t o = 0; o < engine.num_outputs(); ++o)
             fix2float(engine.output_mat_nchw(o), out_fix_points[o], float_outputs[o]);
@@ -289,7 +303,7 @@ void benchmark_camera(std::string xmodel_path,
         std::cout << "warmup 後偵測到 " << (*nms_result)[0].count << " 個框\n";
 
     // ─────────────────────────────────────────────────────────────
-    //  7. 主測試迴圈：單一 pipeline，逐階段計時
+    //  7. 主測試迴圈
     // ─────────────────────────────────────────────────────────────
     std::cout << "開始統計（Ctrl+C 可提早結束）...\n";
     const double t_bench0 = time_now();
@@ -305,19 +319,19 @@ void benchmark_camera(std::string xmodel_path,
         const double t_cap = std::chrono::duration<double>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
 
-        // ── Resize + LetterBox ──────────────────────────────────
+        // ── Resize + LetterBox（產出 BGR，後面直接拿來畫/送）────
         t0 = time_now();
         resize(frame, in_w, resize_result);
         s_resize.add(time_now() - t0);
 
-        // ── 色彩轉換 ────────────────────────────────────────────
+        // ── 色彩轉換（★ 輸出到 rgb_buf，保留 BGR 原圖）──────────
         t0 = time_now();
-        cv::cvtColor(resize_result.img, resize_result.img, cv::COLOR_BGR2RGB);
+        cv::cvtColor(resize_result.img, rgb_buf, cv::COLOR_BGR2RGB);
         s_cvt.add(time_now() - t0);
 
         // ── Normalize + 量化（zero-copy 寫進 DPU input）─────────
         t0 = time_now();
-        norm_and_fix(resize_result.img, in_fix_point, dpu_input);
+        norm_and_fix(rgb_buf, in_fix_point, dpu_input);
         s_quant.add(time_now() - t0);
 
         // ── DPU 推理（含 NHWC→NCHW 轉置）────────────────────────
@@ -339,30 +353,36 @@ void benchmark_camera(std::string xmodel_path,
         // ── NMS ─────────────────────────────────────────────────
         t0 = time_now();
         yolo_pp.nms(conf_th, iou_th);
-        nms_result = &yolo_pp.detections();   // 或你的 getter
+        nms_result = &yolo_pp.detections();
         s_nms.add(time_now() - t0);
 
         det_sum += (*nms_result)[0].count;
 
-        // ── 座標還原 + Tracking ─────────────────────────────────
-        const std::vector<bytetrack::Track>* tracks = nullptr;
+        // ── Tracking（★ identity 映射，座標已在 letterbox 空間）──
         if (do_track) {
             t0 = time_now();
-            scale_detections((*nms_result)[0], boxes, resize_result,
-                             cv::Size(frame.cols, frame.rows));
+            map_detections((*nms_result)[0], boxes,
+                           0.f, 0.f, 1.f, 1.f, draw_size);
             tracks = &tracker.update(boxes, t_cap);
             s_track.add(time_now() - t0);
             trk_sum += static_cast<long long>(tracks->size());
         }
 
-        // ── 繪圖 ────────────────────────────────────────────────
+        // ── 繪圖（★ 目標改成 letterbox 影像）────────────────────
         if (draw) {
             t0 = time_now();
-            if (do_track) draw_tracking(frame, drawn, *tracks, 0.0);
-            else          draw_detection(frame, drawn, (*nms_result)[0], resize_result, 0.0);
+            if (do_track) {
+                draw_tracking(resize_result.img, drawn, *tracks, 0.0);
+            } else {
+                ResizeResult identity;             // ratio=1, pad=0 → 不做反投影
+                identity.img   = resize_result.img;
+                identity.ratio = {1.f, 1.f};
+                identity.pad   = {0, 0};
+                draw_detection(resize_result.img, drawn, (*nms_result)[0], identity, 0.0);
+            }
             s_draw.add(time_now() - t0);
         } else {
-            drawn = frame;
+            drawn = resize_result.img;             // shallow copy，同一塊記憶體
         }
 
         // ── 串流 ────────────────────────────────────────────────
@@ -403,11 +423,10 @@ void benchmark_camera(std::string xmodel_path,
     const double inf_ms  = s_infer.avg();
     const double post_ms = s_deq.avg() + s_dfl.avg() + s_nms.avg();
     const double extra   = s_track.avg() + s_draw.avg() + s_send.avg();
-    const double compute = pre_ms + inf_ms + post_ms + extra;   // 不含擷取
-    const double loop_ms = s_loop.avg();                        // 含擷取
+    const double compute = pre_ms + inf_ms + post_ms + extra;
+    const double loop_ms = s_loop.avg();
 
     print_header("===== 分段耗時（單位 ms，share 以「計算總計」為分母，Capture 以 Loop 為分母）=====");
-    // Capture 用 loop 當分母比較有意義
     print_row(s_cap, loop_ms);
     std::cout << std::string(85, '-') << "\n";
     print_row(s_resize, compute);
@@ -451,17 +470,25 @@ void benchmark_camera(std::string xmodel_path,
                   << static_cast<double>(trk_sum) / done << "\n";
     if (aborted) std::cout << "（測試被中斷，統計基於已完成的 " << done << " 幀）\n";
 
-    // ── 存最後一幀方便確認結果正確 ──────────────────────────────
-    if (!save_last.empty() && !drawn.empty()) {
-        if (!draw)
-            draw_detection(frame, drawn, (*nms_result)[0], resize_result, 0.0);
-        if (cv::imwrite(save_last, drawn))
+    // ── 存最後一幀（★ 存的是 letterbox 影像）────────────────────
+    if (!save_last.empty() && nms_result && !resize_result.img.empty()) {
+        if (!draw) {
+            if (do_track && tracks) {
+                draw_tracking(resize_result.img, drawn, *tracks, 0.0);
+            } else {
+                ResizeResult identity;
+                identity.img   = resize_result.img;
+                identity.ratio = {1.f, 1.f};
+                identity.pad   = {0, 0};
+                draw_detection(resize_result.img, drawn, (*nms_result)[0], identity, 0.0);
+            }
+        }
+        if (!drawn.empty() && cv::imwrite(save_last, drawn))
             std::cout << "最後一幀結果已存至: " << save_last << "\n";
         else
             std::cerr << "imwrite 失敗: " << save_last << "\n";
     }
 }
-
 
 
 // ============================================================================
@@ -483,7 +510,7 @@ int main(int argc, char** argv) {
                                 args.st_height, args.st_fps, args.st_quality};
     // {index, width, height, fps}
     Camera::Config cam_conf{args.cam_index, args.cam_width,
-                            args.cam_height, args.cam_fps};
+                            args.cam_height, args.cam_fps, args.cam_fourcc};
  
     benchmark_camera(args.model_path, cam_conf,
                      args.warmup, args.iter, args.conf, args.iou,

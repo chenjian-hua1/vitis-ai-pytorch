@@ -108,10 +108,12 @@ void resize(const cv::Mat& img, int input_size, ResizeResult& res)
 
     res.ratio = {r,  r};
     res.pad   = {dw, dh};
+    res.content = cv::Rect(left, top, pad_w, pad_h);
 
     res.img.create(input_size, input_size, img.type());
     res.img.setTo(cv::Scalar(0,0,0));
 
     cv::Mat roi = res.img(cv::Rect(left, top, pad_w, pad_h));
-    cv::resize(img, roi, roi.size(), 0, 0, cv::INTER_LINEAR);
+    // cv::resize(img, roi, roi.size(), 0, 0, cv::INTER_LINEAR);
+    cv::resize(img, roi, roi.size(), 0, 0, cv::INTER_AREA);
 }
