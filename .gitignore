@@ -4,6 +4,7 @@
 **/.vai
 train/**/*.pt*
 **/build
+**/vitis_prj
 
 test file/model/resnet18_best.pth
 test file/model/resnet18_pruned.pth

@@ -3,23 +3,34 @@
  *
  * 整數倍 Box-filter 縮小 (2x / 3x)，RGB888 packed，AXI 128-bit 介面
  *
- * 單一 II=1 主迴圈，無 stream、無 DATAFLOW、無巢狀迴圈
+ * 三段 DATAFLOW：運算 -> 位元累積 -> AXI 寫出
+ *
+ *   compute_side    每拍讀一筆 AXI，RGB 三通道並行累加
+ *        |            3 倍：一次運算 2 個 3-pixel block -> 2 個輸出欄
+ *        |            2 倍：一次運算 4 個 2-pixel block -> 4 個輸出欄
+ *        |  hls::stream<ap_uint<96>>   result_ch
+ *        v
+ *   pack_side       把 48/96-bit 結果拼成 128-bit word
+ *        |            仍有條件判斷，但只碰 FIFO 不碰 AXI
+ *        |  hls::stream<ap_uint<128>>  word_ch
+ *        v
+ *   axi_write_side  out_ptr[i] = word_in.read()
+ *                    位址即迴圈變數、無條件包裹，burst inference 必成
  *
  * ============================================================
- *  相對於前版的改動：吞吐加倍
+ *  為什麼寫出要拆成兩段
  * ============================================================
  *
- * 前版：每個 word 配 2 拍，一次運算處理 1 個 3-pixel block
- *       或 2 個 2-pixel block  ->  總拍數 = total_words * 2
+ * 舊版把 out_ptr[word_idx++] 寫在 last_row 與 acc_len>=128 兩層
+ * 條件裡，HLS 判定為條件式存取，gmem1 的 burst 推斷失敗：
+ *   每個 word 變成獨立 AXI 交易，往返約 12 拍
  *
- * 本版：每拍讀一筆 AXI，一次運算處理
- *         3 倍：2 個 3-pixel block = 6 pixel = 144 bit -> 產出 2 個輸出欄
- *         2 倍：4 個 2-pixel block = 8 pixel = 192 bit -> 產出 4 個輸出欄
- *       總拍數 = total_words，約快一倍
+ * 3 倍模式輸出 43200 word：
+ *   43200 x 12 = 518400 拍，與讀取端的 388800 拍相當，
+ *   反壓回主迴圈後總時間翻倍（實測 3307us vs 理論 1555us @250MHz）
  *
- * 因為一次運算需要 144/192 bit 而單筆 AXI 只有 128 bit，
- * AXI 必須全速讀取（II=1）才餵得飽 adder tree。
- * counter 機制因此移除：每拍檢查 leftover 夠不夠一次運算即可。
+ * 拆開後，條件判斷留在 pack_side（只碰 FIFO），
+ * axi_write_side 只做純粹的連續寫出。
  *
  * ============================================================
  *  leftover 狀態序列（設計驗證指紋）
@@ -39,7 +50,7 @@
  *
  * 一次運算同時寫入 n_out 個相鄰輸出欄（3倍 2 個、2倍 4 個）。
  * 若用單一陣列，HLS 無法證明索引不衝突，會報 200-885 埠不足。
- * 故拆成 4 塊獨立陣列，索引一律 idx = ox / 4：
+ * 故拆成 4 塊獨立陣列，索引一律 idx = ox >> 2：
  *   3 倍：ox 每次 +2，交替使用 (bank0,bank1) 與 (bank2,bank3)
  *   2 倍：ox 每次 +4，固定使用 bank0~bank3
  * 兩種模式每塊陣列每拍最多 1 讀 1 寫，T2P 雙埠足夠。
@@ -49,6 +60,7 @@
  *****************************************************************************/
 
 #include "ap_int.h"
+#include "hls_stream.h"
 
 /* ---------------------------------------------------------------- 常數 */
 
@@ -62,38 +74,39 @@
 #define OP_BITS_S3 144      /* 6 pixel x 24 bit */
 #define OP_BITS_S2 192      /* 8 pixel x 24 bit */
 
+/* result FIFO：compute -> pack
+ * 生產 0.889 筆/拍、消費 1.0 筆/拍，只需吸收瞬時波動 */
+#define RES_FIFO_DEPTH  64
+
+/* word FIFO：pack -> axi_write
+ * 生產 0.333 word/拍、消費 1.0 word/拍，餘裕更大 */
+#define WORD_FIFO_DEPTH 64
+
 /* co-simulation 用的模擬記憶體大小，必須是編譯期常數。
- * testbench 的緩衝區配置必須 >= 這裡的值。 */
-//#ifdef COSIM_FULL
-  #define IN_DEPTH   388800    /* 1920*1080*3/16 */
-  #define OUT_DEPTH   97200    /* 960*540*3/16 */
-//#else
-//  #define IN_DEPTH     2048
-//  #define OUT_DEPTH    1024
-//#endif
+ * 取最大工作尺寸 1920x1080 RGB 的需求。
+ * testbench 的緩衝區配置必須 >= 這裡的值，否則 co-sim
+ * 存取模擬記憶體時會越界（症狀為 SIGSEGV）。
+ *
+ * depth 只影響模擬，不影響合成出來的硬體。 */
+#define IN_DEPTH   388800    /* 1920*1080*3/16 */
+#define OUT_DEPTH   97200    /* 960*540*3/16，2 倍模式較大者 */
 
 
 /* ================================================================
- *  Top-level
+ *  第一段：讀取 + 加法樹 + 正規化
+ *
+ *  結果以 96-bit 打包送進 stream：
+ *    3 倍：低 48 bit 有效（2 個輸出 pixel）
+ *    2 倍：全 96 bit 有效（4 個輸出 pixel）
  * ================================================================ */
 
-void resize_kernel(ap_uint<128> *in_ptr,
-                   ap_uint<128> *out_ptr,
-                   int           total_words,
-                   int           out_w,
-                   ap_uint<1>    scale_mode,
-                   ap_uint<16>   inv_scale)
+static void compute_side(ap_uint<128>              *in_ptr,
+                         hls::stream<ap_uint<96> > &result_out,
+                         int                        total_words,
+                         int                        out_w,
+                         ap_uint<1>                 scale_mode,
+                         ap_uint<16>                inv_scale)
 {
-#pragma HLS INTERFACE m_axi port=in_ptr  bundle=gmem0 offset=slave depth=IN_DEPTH \
-    max_read_burst_length=64  num_read_outstanding=16
-#pragma HLS INTERFACE m_axi port=out_ptr bundle=gmem1 offset=slave depth=OUT_DEPTH \
-    max_write_burst_length=64 num_write_outstanding=16
-#pragma HLS INTERFACE s_axilite port=total_words
-#pragma HLS INTERFACE s_axilite port=out_w
-#pragma HLS INTERFACE s_axilite port=scale_mode
-#pragma HLS INTERFACE s_axilite port=inv_scale
-#pragma HLS INTERFACE s_axilite port=return
-
     /* ---- 12 塊 line buffer：3 通道 x 4 bank ----
      * RGB 必須三組獨立：24-bit 打包值直接整數相加會讓 R 溢位污染 G。
      * 4 bank 讓一次運算能同時寫入最多 4 個相鄰輸出欄。 */
@@ -118,22 +131,16 @@ void resize_kernel(ap_uint<128> *in_ptr,
     ap_uint<128> leftover     = 0;   /* 上限 128 bit */
     ap_uint<8>   leftover_len = 0;
 
-    /* ---- 輸出側狀態 ---- */
-    ap_uint<224> acc      = 0;       /* 最壞 127 + 96 = 223 bit */
-    ap_uint<8>   acc_len  = 0;
-    int          word_idx = 0;
-
     /* ---- 位置追蹤 ---- */
     int ox           = 0;
     int row_in_block = 0;
 
-    const bool        s3       = (scale_mode == SCALE_3);
-    const int         v_taps   = s3 ? 3 : 2;
-    const int         n_out    = s3 ? 2 : 4;    /* 一次運算產出幾個輸出欄 */
-    const ap_uint<9>  op_bits  = s3 ? (ap_uint<9>)OP_BITS_S3
-                                    : (ap_uint<9>)OP_BITS_S2;
-    const ap_uint<8>  res_bits = s3 ? (ap_uint<8>)48 : (ap_uint<8>)96;
-    const int         quad_w   = (out_w + 3) >> 2;
+    const bool        s3      = (scale_mode == SCALE_3);
+    const int         v_taps  = s3 ? 3 : 2;
+    const int         n_out   = s3 ? 2 : 4;    /* 一次運算產出幾個輸出欄 */
+    const ap_uint<9>  op_bits = s3 ? (ap_uint<9>)OP_BITS_S3
+                                   : (ap_uint<9>)OP_BITS_S2;
+    const int         quad_w  = (out_w + 3) >> 2;
 
     init_loop: for (int i = 0; i < quad_w; i++) {
 #pragma HLS PIPELINE II=1
@@ -151,8 +158,6 @@ void resize_kernel(ap_uint<128> *in_ptr,
     main_loop: for (int i = 0; i < total_words; i++) {
 #pragma HLS PIPELINE II=1
 #pragma HLS LOOP_TRIPCOUNT min=1 max=400000
-// Close Data DEPENDENCE ->
-// data[i]=Read() & data[i+1]=Write(data[i]+...) Can Run Same time (RW Use 2P BRAM)
 #pragma HLS DEPENDENCE variable=lb0_r inter false
 #pragma HLS DEPENDENCE variable=lb0_g inter false
 #pragma HLS DEPENDENCE variable=lb0_b inter false
@@ -196,8 +201,7 @@ void resize_kernel(ap_uint<128> *in_ptr,
 
             /* ---- 水平方向加總，RGB 三通道並行 ----
              * 3 倍：每 3 個 pixel 一組，共 2 組
-             * 2 倍：每 2 個 pixel 一組，共 4 組
-             * g0/g1 兩種模式都用到，g2/g3 只有 2 倍用 */
+             * 2 倍：每 2 個 pixel 一組，共 4 組 */
             ap_uint<10> h_r[4], h_g[4], h_b[4];
 #pragma HLS ARRAY_PARTITION variable=h_r complete
 #pragma HLS ARRAY_PARTITION variable=h_g complete
@@ -223,9 +227,7 @@ void resize_kernel(ap_uint<128> *in_ptr,
                 }
             }
 
-            /* ---- 讀出四個 bank 的目前累加值 ----
-             * idx 是 bank 內索引，同一次運算的 n_out 個輸出欄
-             * 落在連續的 bank，故 idx 都相同或相差 1 */
+            /* ---- 讀出四個 bank 的目前累加值 ---- */
             int base_idx = ox >> 2;
             int bsel     = ox & 3;          /* 3 倍時交替 0 / 2 */
 
@@ -251,7 +253,9 @@ void resize_kernel(ap_uint<128> *in_ptr,
 
             bool last_row = (row_in_block == v_taps - 1);
 
-            /* ---- 決定寫回值，最後統一寫入 ---- */
+            /* ---- 決定寫回值，最後統一寫入 ----
+             * 刻意不在兩個分支各自寫 BRAM，避免同一陣列出現
+             * 兩個寫入點而被判定需要兩個寫埠（HLS 200-885） */
             ap_uint<ACCW> w0_r = 0, w0_g = 0, w0_b = 0;
             ap_uint<ACCW> w1_r = 0, w1_g = 0, w1_b = 0;
             ap_uint<ACCW> w2_r = 0, w2_g = 0, w2_b = 0;
@@ -318,25 +322,10 @@ void resize_kernel(ap_uint<128> *in_ptr,
                                       | ((ap_uint<24>)o3_g <<  8) | (ap_uint<24>)o3_r;
                 }
 
-                /* ---- 累積到滿 128 bit 才寫 DDR，殘餘留到下次 ----
-                 * 2 倍模式一次進 96 bit，最多需要連寫兩個 word */
-                acc.range(acc_len + res_bits - 1, acc_len) = res.range(res_bits - 1, 0);
-                acc_len += res_bits;
+                /* 送進 FIFO，位元累積與 AXI 寫出交給後續兩段處理 */
+                result_out.write(res);
 
-                if (acc_len >= 128) {
-                    out_ptr[word_idx++] = acc.range(127, 0);
-                    ap_uint<8> rem_len = acc_len - 128;
-                    if (rem_len > 0) {
-                        ap_uint<96> rem = acc.range(acc_len - 1, 128);
-                        acc = 0;
-                        acc.range(rem_len - 1, 0) = rem;
-                    } else {
-                        acc = 0;
-                    }
-                    acc_len = rem_len;
-                }
-
-                /* last_row 時全部歸零，w?_* 維持 0 */
+                /* last_row 時全部歸零，w?_* 保持宣告時的 0 */
 
             } else {
                 w0_r = a0_r; w0_g = a0_g; w0_b = a0_b;
@@ -370,11 +359,123 @@ void resize_kernel(ap_uint<128> *in_ptr,
             }
         }
     }
+}
 
-    /* ---- 收尾：若還有殘餘位元，補寫最後一個 word ---- */
-    if (acc_len > 0) {
-        out_ptr[word_idx] = acc.range(127, 0);
+
+/* ================================================================
+ *  第二段：位元累積（pack）
+ *
+ *  把 48/96-bit 的運算結果拼成 128-bit word，湊滿才丟進 FIFO。
+ *  這段仍有條件判斷，但只碰 FIFO 不碰 AXI，
+ *  burst inference 不受影響。
+ *
+ *  殘餘序列：3 倍 {16,8,0}、2 倍 {16,32,0}
+ * ================================================================ */
+
+static void pack_side(hls::stream<ap_uint<96> >  &result_in,
+                      hls::stream<ap_uint<128> > &word_out,
+                      int                         total_results,
+                      ap_uint<1>                  scale_mode)
+{
+    ap_uint<224> acc     = 0;   /* 最壞 127 + 96 = 223 bit */
+    ap_uint<8>   acc_len = 0;
+
+    const ap_uint<8> res_bits = (scale_mode == SCALE_3)
+                              ? (ap_uint<8>)48 : (ap_uint<8>)96;
+
+    pack_loop: for (int r = 0; r < total_results; r++) {
+#pragma HLS PIPELINE II=1
+#pragma HLS LOOP_TRIPCOUNT min=1 max=300000
+
+        ap_uint<96> res = result_in.read();
+
+        acc.range(acc_len + res_bits - 1, acc_len) = res.range(res_bits - 1, 0);
+        acc_len += res_bits;
+
+        if (acc_len >= 128) {
+            word_out.write(acc.range(127, 0));
+
+            ap_uint<8> rem_len = acc_len - 128;
+
+            /* rem_len 為 0 時 range(-1,0) 是未定義行為，必須 guard */
+            if (rem_len > 0) {
+                ap_uint<96> rem = acc.range(acc_len - 1, 128);
+                acc = 0;
+                acc.range(rem_len - 1, 0) = rem;
+            } else {
+                acc = 0;
+            }
+            acc_len = rem_len;
+        }
     }
+
+    /* 收尾：殘餘位元補成最後一個 word
+     * 640x360 RGB 總輸出 5529600 bit / 128 = 43200 整除，
+     * 此分支實務上不會觸發，保留作為 assertion */
+    if (acc_len > 0)
+        word_out.write(acc.range(127, 0));
+}
+
+
+/* ================================================================
+ *  第三段：AXI 寫出
+ *
+ *  這一段存在的唯一理由是讓 burst inference 成立。
+ *  迴圈只做「讀 FIFO、寫 DDR」，位址是純粹的迴圈變數 i，
+ *  沒有任何條件包裹——這是 burst inference 最理想的形式。
+ * ================================================================ */
+
+static void axi_write_side(hls::stream<ap_uint<128> > &word_in,
+                           ap_uint<128>               *out_ptr,
+                           int                         out_words)
+{
+    write_loop: for (int i = 0; i < out_words; i++) {
+#pragma HLS PIPELINE II=1
+#pragma HLS LOOP_TRIPCOUNT min=1 max=100000
+        out_ptr[i] = word_in.read();
+    }
+}
+
+
+/* ================================================================
+ *  Top-level
+ * ================================================================ */
+
+void resize_kernel(ap_uint<128> *in_ptr,
+                   ap_uint<128> *out_ptr,
+                   int           total_words,
+                   int           total_results,
+                   int           out_words,
+                   int           out_w,
+                   ap_uint<1>    scale_mode,
+                   ap_uint<16>   inv_scale)
+{
+#pragma HLS INTERFACE m_axi port=in_ptr  bundle=gmem0 offset=slave depth=IN_DEPTH \
+    max_read_burst_length=64  num_read_outstanding=16
+#pragma HLS INTERFACE m_axi port=out_ptr bundle=gmem1 offset=slave depth=OUT_DEPTH \
+    max_write_burst_length=64 num_write_outstanding=16
+#pragma HLS INTERFACE s_axilite port=total_words
+#pragma HLS INTERFACE s_axilite port=total_results
+#pragma HLS INTERFACE s_axilite port=out_words
+#pragma HLS INTERFACE s_axilite port=out_w
+#pragma HLS INTERFACE s_axilite port=scale_mode
+#pragma HLS INTERFACE s_axilite port=inv_scale
+#pragma HLS INTERFACE s_axilite port=return
+
+#pragma HLS DATAFLOW
+
+    hls::stream<ap_uint<96> >  result_ch;
+    hls::stream<ap_uint<128> > word_ch;
+#pragma HLS STREAM variable=result_ch depth=RES_FIFO_DEPTH
+#pragma HLS STREAM variable=word_ch   depth=WORD_FIFO_DEPTH
+
+    /* 兩個 FIFO 都很淺，用 SRL 實作不佔 BRAM */
+#pragma HLS BIND_STORAGE variable=result_ch type=fifo impl=srl
+#pragma HLS BIND_STORAGE variable=word_ch   type=fifo impl=srl
+
+    compute_side  (in_ptr, result_ch, total_words, out_w, scale_mode, inv_scale);
+    pack_side     (result_ch, word_ch, total_results, scale_mode);
+    axi_write_side(word_ch, out_ptr, out_words);
 }
 
 
@@ -382,49 +483,44 @@ void resize_kernel(ap_uint<128> *in_ptr,
  * Host 端參數
  *
  *   3 倍  1920x1080 -> 640x360
- *     total_words = 1920 * 1080 * 3 / 16 = 388800
- *     out_w       = 640      （必須是 2 的倍數）
- *     scale_mode  = SCALE_3
- *     inv_scale   = 65536 / 9 = 7282
+ *     total_words   = 1920 * 1080 * 3 / 16 = 388800
+ *     total_results = 640 * 360 / 2        = 115200  （一次運算產出 2 欄）
+ *     out_words     = 640 * 360 * 3 / 16   = 43200   （輸出 128-bit word 數）
+ *     out_w         = 640    （必須是 2 的倍數）
+ *     scale_mode    = SCALE_3
+ *     inv_scale     = 65536 / 9 = 7282
  *
  *   2 倍  1920x1080 -> 960x540
- *     total_words = 388800
- *     out_w       = 960      （必須是 4 的倍數）
- *     scale_mode  = SCALE_2
- *     inv_scale   = 65536 / 4 = 16384
+ *     total_words   = 388800
+ *     total_results = 960 * 540 / 4        = 129600  （一次運算產出 4 欄）
+ *     out_words     = 960 * 540 * 3 / 16   = 97200
+ *     out_w         = 960    （必須是 4 的倍數）
+ *     scale_mode    = SCALE_2
+ *     inv_scale     = 65536 / 4 = 16384
  *
  *
  * 效能預期
  *
- *   總拍數 = total_words = 388800（前版為 777600，約快一倍）
+ *   總拍數 = total_words = 388800
  *   KV260 @ 250 MHz -> 1.56 ms -> 640 FPS
- *   實測扣除 DDR 開銷約 500~570 FPS
- *
- *   DDR 讀取需求提高到 128 bit/cycle x 250 MHz = 4 GB/s
- *   KV260 的 LPDDR4-4266 實測可用約 20 GB/s，仍充裕
- *
- *
- * 資源預期（相對前版）
- *
- *   DSP        6  -> 12   （3 倍用 6 顆、2 倍用 12 顆，取大者）
- *   line buffer 6 -> 12 塊（每塊深度 out_w/4）
- *   加法器     約翻倍
- *   window    192 -> 256 bit，桶形移位器成本上升
  *
  *
  * 合成後確認
  *
- *   1. main_loop 的 Interval 必須是 1
- *      若報 200-885，檢查是否有陣列同拍被存取兩次以上
+ *   1. 三個迴圈的 Interval 皆為 1
+ *      main_loop / pack_loop / write_loop
  *
  *   2. DSP = 12（三通道 x 四組輸出）
  *      已用 BIND_OP impl=dsp 明確綁定，report 的 DSP 欄應為 12。
- *      若少於 12，代表某些乘法仍被推成 LUT 或被共用序列化。
  *      切勿加 ALLOCATION instances=mul limit=N，那會強制共用、破壞 II=1。
  *
  *   3. console 出現 in_ptr 與 out_ptr 的 burst inferred 訊息
+ *      特別確認 gmem1：write_loop 現在是純粹的
+ *          out_ptr[i] = word_in.read();
+ *      位址即迴圈變數、無條件包裹，應該必定成立。
  *
- *   4. 3 倍模式總 latency 預期約 39 萬 cycle
+ *   4. co-sim 的 main_loop Iteration Max II 應接近 1
+ *      （synthesis 的 II=1 只是排程結果，co-sim 才反映 AXI 實際延遲）
  *
  *
  * C simulation 驗證

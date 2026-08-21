@@ -30,6 +30,8 @@
 void resize_kernel(ap_uint<128> *in_ptr,
                    ap_uint<128> *out_ptr,
                    int           total_words,
+                   int           total_results,
+                   int           out_words,
                    int           out_w,
                    ap_uint<1>    scale_mode,
                    ap_uint<16>   inv_scale);
@@ -180,17 +182,12 @@ static void gen_test_image(unsigned char *img, int w, int h, int mode)
  * ================================================================ */
 
 /* 必須與 kernel 的 #pragma HLS INTERFACE depth 一致，改動時兩邊要同步。
+ * 緩衝區一律配到完整解析度的大小，跑小圖時多配的部分閒置即可。
  *
- * 預設（小圖）：co-sim 幾秒完成，適合功能迭代
- * COSIM_FULL   ：1920x1080 完整解析度，C sim 約數十秒，
- *                co-sim 需數小時，通常只跑 C simulation */
-//#ifdef COSIM_FULL
-  #define IN_DEPTH   388800      /* 1920*1080*3/16 */
-  #define OUT_DEPTH   97200      /* 960*540*3/16，2 倍模式較大者 */
-//#else
-//  #define IN_DEPTH     2048
-//  #define OUT_DEPTH    1024
-//#endif
+ * 注意：co-sim 會依 depth 模擬整段記憶體，跑滿 388800 word 需時甚久。
+ *       功能迭代建議只跑 C simulation，co-sim 留到最後驗證。 */
+#define IN_DEPTH   388800      /* 1920*1080*3/16 */
+#define OUT_DEPTH   97200      /* 960*540*3/16，2 倍模式較大者 */
 
 static void pack_to_words(const unsigned char *src, int nbytes,
                           std::vector<ap_uint<128> > &words)
@@ -281,8 +278,12 @@ static bool run_case(int src_w, int src_h, int scale, int img_mode,
     std::vector<ap_uint<128> > out_words(OUT_DEPTH, 0);
 
     /* --- 執行 kernel --- */
+    /* total_results = 運算次數：3 倍一次產出 2 欄、2 倍一次產出 4 欄 */
+    int total_results = (dst_w * dst_h) / n_out;
+
     resize_kernel(&in_words[0], &out_words[0],
-                  total_words, dst_w, mode, (ap_uint<16>)inv_scale);
+                  total_words, total_results, n_out_words, dst_w,
+                  mode, (ap_uint<16>)inv_scale);
 
     unpack_from_words(out_words, &got[0], dst_bytes);
 
@@ -354,11 +355,11 @@ int main()
 
     printf("################################################\n");
     printf("#  resize_kernel C 驗證\n");
-//#ifdef COSIM_FULL
-    printf("#  模式：COSIM_FULL（含 1920x1080，C sim 約數十秒）\n");
-//#else
-//    printf("#  模式：快速（小尺寸，定義 COSIM_FULL 可跑完整解析度）\n");
-//#endif
+#ifdef SKIP_BIG_CASES
+    printf("#  模式：僅小尺寸（定義 SKIP_BIG_CASES 已跳過大案例）\n");
+#else
+    printf("#  模式：完整（含 1920x1080，C sim 約數十秒）\n");
+#endif
     printf("################################################\n");
 
     /* ---- 第一部分：leftover 狀態序列 ---- */
@@ -402,9 +403,10 @@ int main()
     total++; if (run_case(192, 27, 3, 0, "3倍 192x27 隨機"))     passed++;
     total++; if (run_case(192, 24, 2, 0, "2倍 192x24 隨機"))     passed++;
 
-    /* 大尺寸案例只在 COSIM_FULL 下啟用
-     * （需要更大的 depth，C sim 約數十秒，co-sim 需數小時）*/
-//#ifdef COSIM_FULL
+    /* 大尺寸案例
+     * C simulation 約數十秒；co-sim 這幾個會跑很久，
+     * 需要時可用 BIG_CASES 開關關掉。 */
+#ifndef SKIP_BIG_CASES
     total++; if (run_case(480,  270, 3, 0, "3倍 480x270 隨機"))     passed++;
     total++; if (run_case(480,  270, 2, 0, "2倍 480x270 隨機"))     passed++;
 
@@ -413,7 +415,7 @@ int main()
     total++; if (run_case(1920, 1080, 3, 3, "3倍 1920x1080 垂直漸層")) passed++;
     total++; if (run_case(1920, 1080, 2, 0, "2倍 1920x1080 隨機")) passed++;
     total++; if (run_case(1920, 1080, 2, 3, "2倍 1920x1080 垂直漸層")) passed++;
-//#endif
+#endif
 
     /* ---- 總結 ---- */
 
