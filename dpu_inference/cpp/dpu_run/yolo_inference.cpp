@@ -148,7 +148,7 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
         //     std::this_thread::sleep_for(std::chrono::milliseconds(1));
         // }
         // if (!g_running) break;
-        // lastFrameId = curFrameId;
+        lastFrameId = curFrameId;
 
 
         double t_wait1 = time_now();

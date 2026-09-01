@@ -40,7 +40,7 @@ struct CliArgs {
     int    st_port     = 5000;
     int    st_width    = 640;
     int    st_height   = 640;
-    double st_fps      = 30.0;
+    double st_fps      = 60.0;
     int    st_quality  = 60;
 
     // 輸出

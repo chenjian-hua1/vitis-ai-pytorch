@@ -107,12 +107,12 @@
  *    2 倍：全 96 bit 有效（4 個輸出 pixel）
  * ================================================================ */
 
-static void compute_side(ap_uint<128>              *in_ptr,
-                         hls::stream<ap_uint<96> > &result_out,
-                         int                        total_words,
-                         int                        out_w,
-                         ap_uint<1>                 scale_mode,
-                         ap_uint<16>                inv_scale)
+static void compute_side(ap_uint<128>                  *in_ptr,
+                         hls::stream<ap_uint<96> >     &result_out,
+                         ap_uint<LOG2_CEIL(IN_DEPTH)>  total_words,
+                         ap_uint<LOG2_CEIL(OUT_W_MAX)> out_w,
+                         ap_uint<1>                    scale_mode,
+                         ap_uint<16>                   inv_scale)
 {
     /* ---- 4 塊 line buffer，RGB 打包在同一個 36-bit 字 ----
      *
@@ -154,9 +154,9 @@ static void compute_side(ap_uint<128>              *in_ptr,
     const ap_uint<9>  op_bits = s3 ? (ap_uint<9>)OP_BITS_S3
                                    : (ap_uint<9>)OP_BITS_S2;
 //    const int   quad_w  = (out_w + 3) >> 2;
-    const ap_uint<LOG2_CEIL((OUT_W_MAX+3)>>2)>   quad_w  = (out_w + 3) >> 2;
+    const ap_uint<LOG2_CEIL(QUAD_W_MAX)>   quad_w  = (out_w + 3) >> 2;
 
-    init_loop: for (int i = 0; i < quad_w; i++) {
+    init_loop: for (ap_uint<FOR_IDX_BITS(QUAD_W_MAX)> i = 0; i < quad_w; i++) {
 #pragma HLS PIPELINE II=1
 #pragma HLS LOOP_TRIPCOUNT min=1 max=QUAD_W_MAX
         lb0[i] = 0; lb1[i] = 0; lb2[i] = 0; lb3[i] = 0;
@@ -167,9 +167,9 @@ static void compute_side(ap_uint<128>              *in_ptr,
      * ================================================================ */
 
     // main_loop: for (int i = 0; i < total_words; i++) {
-    main_loop: for (ap_uint<FOR_IDX_BITS(400000)> i = 0; i < total_words; i++) {
+    main_loop: for (ap_uint<FOR_IDX_BITS(IN_DEPTH)> i = 0; i < total_words; i++) {
 #pragma HLS PIPELINE II=1
-#pragma HLS LOOP_TRIPCOUNT min=1 max=400000
+#pragma HLS LOOP_TRIPCOUNT min=1 max=IN_DEPTH
 #pragma HLS DEPENDENCE variable=lb0 inter false
 #pragma HLS DEPENDENCE variable=lb1 inter false
 #pragma HLS DEPENDENCE variable=lb2 inter false
@@ -411,7 +411,7 @@ static void compute_side(ap_uint<128>              *in_ptr,
 
 static void pack_side(hls::stream<ap_uint<96> >  &result_in,
                       hls::stream<ap_uint<128> > &word_out,
-                      int                         total_results,
+                      ap_uint<LOG2_CEIL(OUT_DEPTH)> total_results,
                       ap_uint<1>                  scale_mode)
 {
     ap_uint<224> acc     = 0;   /* 最壞 127 + 96 = 223 bit */
@@ -421,9 +421,9 @@ static void pack_side(hls::stream<ap_uint<96> >  &result_in,
                               ? (ap_uint<8>)48 : (ap_uint<8>)96;
 
     // pack_loop: for (int r = 0; r < total_results; r++) {
-    pack_loop: for (ap_uint<FOR_IDX_BITS(300000)> r = 0; r < total_results; r++) {
+    pack_loop: for (ap_uint<FOR_IDX_BITS(OUT_DEPTH)> r = 0; r < total_results; r++) {
 #pragma HLS PIPELINE II=1
-#pragma HLS LOOP_TRIPCOUNT min=1 max=300000
+#pragma HLS LOOP_TRIPCOUNT min=1 max=OUT_DEPTH
 
         ap_uint<96> res = result_in.read();
 
@@ -465,12 +465,12 @@ static void pack_side(hls::stream<ap_uint<96> >  &result_in,
 
 static void axi_write_side(hls::stream<ap_uint<128> > &word_in,
                            ap_uint<128>               *out_ptr,
-                           int                         out_words)
+                           ap_uint<LOG2_CEIL(OUT_DEPTH)>  out_words)
 {
     // write_loop: for (int i = 0; i < out_words; i++) {
-    write_loop: for (ap_uint<FOR_IDX_BITS(100000)> i = 0; i < out_words; i++) {
+    write_loop: for (ap_uint<FOR_IDX_BITS(OUT_DEPTH)> i = 0; i < out_words; i++) {
 #pragma HLS PIPELINE II=1
-#pragma HLS LOOP_TRIPCOUNT min=1 max=100000
+#pragma HLS LOOP_TRIPCOUNT min=1 max=OUT_DEPTH
         out_ptr[i] = word_in.read();
     }
 }
@@ -482,12 +482,12 @@ static void axi_write_side(hls::stream<ap_uint<128> > &word_in,
 
 void resize_kernel(ap_uint<128> *in_ptr,
                    ap_uint<128> *out_ptr,
-                   int           total_words,
-                   int           total_results,
-                   int           out_words,
-                   int           out_w,
-                   ap_uint<1>    scale_mode,
-                   ap_uint<16>   inv_scale)
+                   ap_uint<32>  total_words,
+                   ap_uint<32>  total_results,
+                   ap_uint<32>  out_words,
+                   ap_uint<32>  out_w,
+                   ap_uint<1>   scale_mode,
+                   ap_uint<16>  inv_scale)
 {
 #pragma HLS INTERFACE m_axi port=in_ptr  bundle=gmem0 offset=slave depth=IN_DEPTH \
     max_read_burst_length=64  num_read_outstanding=16
@@ -512,9 +512,13 @@ void resize_kernel(ap_uint<128> *in_ptr,
 #pragma HLS BIND_STORAGE variable=result_ch type=fifo impl=srl
 #pragma HLS BIND_STORAGE variable=word_ch   type=fifo impl=srl
 
-    compute_side  (in_ptr, result_ch, total_words, out_w, scale_mode, inv_scale);
-    pack_side     (result_ch, word_ch, total_results, scale_mode);
-    axi_write_side(word_ch, out_ptr, out_words);
+    // compute_side  (in_ptr, result_ch, total_words, out_w, scale_mode, inv_scale);
+    // pack_side     (result_ch, word_ch, total_results, scale_mode);
+    // axi_write_side(word_ch, out_ptr, out_words);
+
+    compute_side  (in_ptr, result_ch, total_words.range(LOG2_CEIL(IN_DEPTH)-1,0), out_w.range(LOG2_CEIL(OUT_DEPTH)-1,0), scale_mode, inv_scale);
+    pack_side     (result_ch, word_ch, total_results.range(LOG2_CEIL(OUT_DEPTH)-1,0), scale_mode);
+    axi_write_side(word_ch, out_ptr, out_words.range(LOG2_CEIL(OUT_DEPTH)-1,0));
 }
 
 
