@@ -34,7 +34,8 @@ if [[ "$IS_CROSS" == "1" ]]; then
     # ============================================================
     # 🔥 全部寫死，不靠環境變數
     # ============================================================
-    PETALINUX_ROOT="/media/jianhua/TOSIBA_HDD/petalinux/cross_compile"
+    # PETALINUX_ROOT="/media/jianhua/TOSIBA_HDD/petalinux/cross_compile"
+    PETALINUX_ROOT="/home/jianhua/petalinux/cross_compile"
     SYSROOT="$PETALINUX_ROOT/sysroots/cortexa72-cortexa53-xilinx-linux"
     HOST_TOOLS="$PETALINUX_ROOT/sysroots/x86_64-petalinux-linux"
     COMPILER="$HOST_TOOLS/usr/bin/aarch64-xilinx-linux/aarch64-xilinx-linux-g++"
