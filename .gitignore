@@ -22,3 +22,4 @@ dpu_inference/cpp/dpu_run/detection_result.jpg
 dpu_inference/model/yolo_kv26 copy.xmodel
 dpu_inference/cpp/eval/trackeval_io
 dpu_inference/cpp/eval/trackeval_tmp
+**/hls_include

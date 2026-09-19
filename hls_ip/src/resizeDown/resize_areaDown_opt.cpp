@@ -18,6 +18,17 @@
  *                    位址即迴圈變數、無條件包裹，burst inference 必成
  *
  * ============================================================
+ *  撰寫規則
+ * ============================================================
+ *
+ *  1. 位元打包 / 拆解一律寫成 range 對 range，不使用 shift + OR。
+ *  2. 加減乘一律明確指定運算元與結果寬度：
+ *       ap_uint<N+1> = ap_uint<N>(a) + ap_uint<N>(b)
+ *     旁邊註明數值上限作為依據。
+ *  3. 有規律的切片寫成 UNROLL 迴圈，索引可用乘法，
+ *     展開後為常數，只剩接線。
+ *
+ * ============================================================
  *  為什麼寫出要拆成兩段
  * ============================================================
  *
@@ -33,6 +44,33 @@
  * axi_write_side 只做純粹的連續寫出。
  *
  * ============================================================
+ *  運算路徑與 DSP
+ * ============================================================
+ *
+ *  每組 g、每通道 k：
+ *    A = bank 累加值 + 第一個 pixel     fabric 加法器
+ *    D = 第二個 pixel + 第三個 pixel    fabric 加法器
+ *
+ *  g0 / g1（3 倍、2 倍共用）：
+ *    M = (A + D) * B                    DSP48E2：pre-adder + 乘法器
+ *    B = last_row ? inv_scale : 65536
+ *      last_row   ：M[23:16] = 正規化後的 8-bit 輸出
+ *      非 last_row：M[27:16] = A + D，寫回 BRAM
+ *    pre-adder 的 AD 在 DSP 內部拉不出來，若在 fabric 另算一份
+ *    A + D，HLS 就不會把加法吸收進 DSP，故非最後一列也乘 65536。
+ *
+ *  g2 / g3（只有 2 倍會用到）：
+ *    2 倍權重 16384 = 2^14，(S * 2^14) >> 16 = S >> 2
+ *    正規化只是取 S[9:2]，不需要 DSP。
+ *
+ *  DSP 總數 = 2 組 x 3 通道 = 6
+ *
+ *  分組：
+ *    3 倍：g0 = (bank + p0) + (p1 + p2)
+ *          g1 = (bank + p3) + (p4 + p5)
+ *    2 倍：g  = (bank + p[2g]) + (p[2g+1] + 0)
+ *
+ * ============================================================
  *  leftover 狀態序列（設計驗證指紋）
  * ============================================================
  *
@@ -44,6 +82,16 @@
  *   兩者 leftover 上限皆 128 bit -> window = 128+128 = 256 bit
  *   第一批必然 do_op = 0（128 < 144），這是正常的暖機行為
  *
+ *   程式內以 lsel = leftover_len / 16 表示：
+ *     3 倍 {8,7,6,5,4,3,2,1,0}，2 倍 {8,4,0}
+ *
+ *  leftover 恆為「上一筆 beat 的最高 leftover_len bit」：
+ *    op_bits >= 144 > 128 >= leftover_len，所以一次運算會把舊 leftover
+ *    全部吃掉，剩下的只來自本次 beat 的高位：
+ *      do_op  ：新 leftover = beat[127 : op_bits - len]（beat 的最高 new_len bit）
+ *      !do_op ：只發生在 len = 0，新 leftover = beat（最高 128 bit）
+ *    因此只需存 prev_beat 與 lsel，迴圈回授路徑上沒有 256-bit 位移器。
+ *
  * ============================================================
  *  line buffer 分 bank
  * ============================================================
@@ -51,13 +99,10 @@
  * 一次運算同時寫入 n_out 個相鄰輸出欄（3倍 2 個、2倍 4 個）。
  * 若用單一陣列，HLS 無法證明索引不衝突，會報 200-885 埠不足。
  * 故拆成 4 塊獨立陣列，索引一律 idx = ox >> 2。
- * 每塊陣列的每一格存 RGB 打包後的 36-bit 值（3 x 12 bit），
- * 剛好是單顆 BRAM18 最寬配置的上限，相對 RGB 各自一塊省下 8 顆 BRAM：
+ * 每格存 36-bit：[35:24]=B  [23:12]=G  [11:0]=R
  *   3 倍：ox 每次 +2，交替使用 (bank0,bank1) 與 (bank2,bank3)
  *   2 倍：ox 每次 +4，固定使用 bank0~bank3
  * 兩種模式每塊陣列每拍最多 1 讀 1 寫，T2P 雙埠足夠。
- *
- * 本版經 bit-accurate 模型驗證，12/12 案例通過。
  *
  *****************************************************************************/
 
@@ -70,13 +115,14 @@
 #define SCALE_2    0        /* 2 倍縮小：2x2 box */
 #define SCALE_3    1        /* 3 倍縮小：3x3 box */
 
-#define OUT_W_MAX  960      /* 輸出寬度上限 */
+#define OUT_W_MAX  960      /* 輸出寬度上限（ox 用 10 bit） */
 #define QUAD_W_MAX 240      /* OUT_W_MAX / 4，每 bank 的深度 */
-/* 單通道累加器位元寬。3 倍模式最壞 9 x 255 = 2295 < 4096，12 bit 足夠。
- * 選 12 是為了讓 RGB 三通道打包後剛好 36 bit，塞進單顆 BRAM18
- * 的最寬配置（512 x 36）。經全白極端值測試驗證不溢位。 */
+
+/* 單通道累加器 12 bit（3 倍最壞 9 x 255 = 2295 < 4096）
+ * RGB 打包後 36 bit，剛好是單顆 BRAM18 最寬配置（512 x 36）。
+ * 下方 range 皆以 ACCW=12、PACKW=36 計算，更改時需一併修改。 */
 #define ACCW       12
-#define PACKW      (ACCW * 3)   /* 36 bit：RGB 打包後的寬度 */
+#define PACKW      36
 
 #define OP_BITS_S3 144      /* 6 pixel x 24 bit */
 #define OP_BITS_S2 192      /* 8 pixel x 24 bit */
@@ -90,21 +136,30 @@
 #define WORD_FIFO_DEPTH 64
 
 /* co-simulation 用的模擬記憶體大小，必須是編譯期常數。
- * 取最大工作尺寸 1920x1080 RGB 的需求。
  * testbench 的緩衝區配置必須 >= 這裡的值，否則 co-sim
  * 存取模擬記憶體時會越界（症狀為 SIGSEGV）。
- *
  * depth 只影響模擬，不影響合成出來的硬體。 */
 #define IN_DEPTH   388800    /* 1920*1080*3/16 */
 #define OUT_DEPTH   97200    /* 960*540*3/16，2 倍模式較大者 */
+
+/* total_results 上限。注意它不是 OUT_DEPTH：
+ *   3 倍 640*360/2 = 115200、2 倍 960*540/4 = 129600，都大於 97200 */
+#define RES_MAX    129600
+
+/* 迴圈索引型別 */
+typedef ap_uint<FOR_IDX_BITS(QUAD_W_MAX)> quad_idx_t;
+typedef ap_uint<FOR_IDX_BITS(IN_DEPTH)>   main_idx_t;
+typedef ap_uint<FOR_IDX_BITS(RES_MAX)>    pack_idx_t;
+typedef ap_uint<FOR_IDX_BITS(OUT_DEPTH)>  wr_idx_t;
 
 
 /* ================================================================
  *  第一段：讀取 + 加法樹 + 正規化
  *
- *  結果以 96-bit 打包送進 stream：
- *    3 倍：低 48 bit 有效（2 個輸出 pixel）
- *    2 倍：全 96 bit 有效（4 個輸出 pixel）
+ *  result 96-bit 打包格式，pixel g 的通道 k 位於
+ *    [g*24 + k*8 + 7 : g*24 + k*8]，k: 0=R 1=G 2=B
+ *  3 倍：低 48 bit 有效（2 個輸出 pixel）
+ *  2 倍：全 96 bit 有效（4 個輸出 pixel）
  * ================================================================ */
 
 static void compute_side(ap_uint<128>                  *in_ptr,
@@ -114,18 +169,6 @@ static void compute_side(ap_uint<128>                  *in_ptr,
                          ap_uint<1>                    scale_mode,
                          ap_uint<16>                   inv_scale)
 {
-    /* ---- 4 塊 line buffer，RGB 打包在同一個 36-bit 字 ----
-     *
-     * 每格存 [B:G:R] 三個 12-bit 值，共 36 bit，剛好是單顆 BRAM18
-     * 最寬配置的上限。相對於 RGB 各自一塊（12 塊陣列）：
-     *   BRAM  12 顆 -> 4 顆
-     *   使用率 18% -> 47%
-     *   記憶體埠 24 個 -> 8 個，排程壓力大減
-     *
-     * 打包只是儲存格式，不是運算格式：讀出後先切片成三個獨立的
-     * 12-bit 值各自加法，再打包回去，所以不會有 R 溢位污染 G 的問題。
-     *
-     * 4 bank 讓一次運算能同時寫入最多 4 個相鄰輸出欄。 */
     ap_uint<PACKW> lb0[QUAD_W_MAX];
     ap_uint<PACKW> lb1[QUAD_W_MAX];
     ap_uint<PACKW> lb2[QUAD_W_MAX];
@@ -135,28 +178,35 @@ static void compute_side(ap_uint<128>                  *in_ptr,
 #pragma HLS BIND_STORAGE variable=lb2 type=RAM_T2P impl=BRAM
 #pragma HLS BIND_STORAGE variable=lb3 type=RAM_T2P impl=BRAM
 
-    /* ---- 輸入側狀態 ---- */
-    ap_uint<128> leftover     = 0;   /* 上限 128 bit */
-    ap_uint<8>   leftover_len = 0;
+    /* ---- 輸入側狀態 ----
+     * leftover 永遠是「上一筆 beat 的最高 leftover_len 個 bit」
+     * （證明見檔頭），所以直接存整筆 beat，回授路徑上沒有任何邏輯。
+     * leftover_len 只會是 16 的倍數，以 lsel = leftover_len / 16 表示。 */
+    ap_uint<128> prev_beat = 0;
+    ap_uint<4>   lsel      = 0;      /* 0..8 */
 
     /* ---- 位置追蹤 ---- */
-    // int ox           = 0;
-    // int row_in_block = 0;
-
-    // Which Column in Line
-    ap_uint<LOG2_CEIL(OUT_W_MAX)> ox           = 0;
-    // Which Row of Block   Max Value is 3
-    ap_uint<LOG2_CEIL(3)> row_in_block = 0;
+    ap_uint<10> ox           = 0;    /* 目前輸出欄，0..958 */
+    ap_uint<2>  row_in_block = 0;    /* 目前在 block 的第幾列，0..2 */
 
     const bool        s3      = (scale_mode == SCALE_3);
-    const ap_uint<LOG2_CEIL(3)> v_taps  = s3 ? 3 : 2;
-    const ap_uint<LOG2_CEIL(4)> n_out   = s3 ? 2 : 4;    /* 一次運算產出幾個輸出欄 */
-    const ap_uint<9>  op_bits = s3 ? (ap_uint<9>)OP_BITS_S3
-                                   : (ap_uint<9>)OP_BITS_S2;
-//    const int   quad_w  = (out_w + 3) >> 2;
-    const ap_uint<LOG2_CEIL(QUAD_W_MAX)>   quad_w  = (out_w + 3) >> 2;
+    const ap_uint<2>  v_taps  = s3 ? 3 : 2;
+    /* 一次運算產出幾個輸出欄。需 3 bit 才存得下 4：
+     * 若用 ap_uint<LOG2_CEIL(4)> = ap_uint<2>，4 會變成 0，ox 永不前進 */
+    const ap_uint<3>  n_out   = s3 ? 2 : 4;
+    /* 一次運算消耗的位元數 / 16：3 倍 144/16 = 9，2 倍 192/16 = 12 */
+    const ap_uint<4>  op_sel  = s3 ? (ap_uint<4>)(OP_BITS_S3 / 16)
+                                   : (ap_uint<4>)(OP_BITS_S2 / 16);
 
-    init_loop: for (ap_uint<FOR_IDX_BITS(QUAD_W_MAX)> i = 0; i < quad_w; i++) {
+    /* v_taps - 1：2b - 2b，結果 1 或 2 */
+    const ap_uint<2>  v_last  = ap_uint<2>(v_taps) - ap_uint<2>(1);
+
+    /* quad_w = (out_w + 3) >> 2
+     * out_w <= 960，+3 <= 963 (11b)，>>2 <= 240 (8b) */
+    const ap_uint<11> out_w_p3 = ap_uint<10>(out_w) + ap_uint<10>(3);
+    const ap_uint<LOG2_CEIL(QUAD_W_MAX)> quad_w = out_w_p3.range(10, 2);
+
+    init_loop: for (quad_idx_t i = 0; i < quad_w; i = quad_idx_t(i) + quad_idx_t(1)) {
 #pragma HLS PIPELINE II=1
 #pragma HLS LOOP_TRIPCOUNT min=1 max=QUAD_W_MAX
         lb0[i] = 0; lb1[i] = 0; lb2[i] = 0; lb3[i] = 0;
@@ -166,8 +216,7 @@ static void compute_side(ap_uint<128>                  *in_ptr,
      *  主迴圈：每拍讀一筆 AXI
      * ================================================================ */
 
-    // main_loop: for (int i = 0; i < total_words; i++) {
-    main_loop: for (ap_uint<FOR_IDX_BITS(IN_DEPTH)> i = 0; i < total_words; i++) {
+    main_loop: for (main_idx_t i = 0; i < total_words; i = main_idx_t(i) + main_idx_t(1)) {
 #pragma HLS PIPELINE II=1
 #pragma HLS LOOP_TRIPCOUNT min=1 max=IN_DEPTH
 #pragma HLS DEPENDENCE variable=lb0 inter false
@@ -177,222 +226,208 @@ static void compute_side(ap_uint<128>                  *in_ptr,
 
         /* ---- 無條件連續讀取，burst inference 條件最佳 ---- */
         ap_uint<128> beat = in_ptr[i];
+        ap_uint<128> prev_beat_q = prev_beat;   /* 本次使用的上一筆 beat */
+
+        /* ---- 狀態更新（迴圈回授，只有 4-bit 運算）----
+         * total / 16 = lsel + 8：4b + 4b -> 5b，<= 16 */
+        ap_uint<5> tsel  = ap_uint<4>(lsel) + ap_uint<4>(8);
+        bool       do_op = (tsel >= op_sel);
+
+        /* 湊不滿一次運算就全部留到下次；只會發生在 lsel = 0（第一批必然如此）
+         * tsel - op_sel：只在 do_op 時使用，不會下溢，<= 7 */
+        ap_uint<5> tsub = ap_uint<5>(tsel) - ap_uint<5>(op_sel);
+
+        ap_uint<4> lsel_cur = lsel;
+        lsel      = do_op ? ap_uint<4>(tsub.range(3, 0))    /* <= 7 */
+                          : ap_uint<4>(tsel.range(3, 0));   /* 必為 8 */
+        prev_beat = beat;
+
+        /* ---- 組 window（前饋路徑，可被 pipeline 切開）----
+         * cat = {beat, prev_beat}
+         * w   = cat 右移 (8 - lsel) * 16，即 {beat, prev_beat 最高 lsel*16 bit}
+         * lsel 只有 9 種值，寫成 9 選 1 mux，取代通用 barrel shifter */
+        ap_uint<256> cat;
+        cat.range(255, 128) = beat;
+        cat.range(127,   0) = prev_beat_q;
 
         ap_uint<256> w = 0;
-        if (leftover_len > 0)
-            w.range(leftover_len - 1, 0) = leftover;
-        w.range(leftover_len + 127, leftover_len) = beat;
-
-        ap_uint<9> total = leftover_len + 128;
-        bool do_op = (total >= op_bits);
-
-        /* 湊不滿一次運算就全部留到下次；第一批必然如此（128 < 144） */
-        ap_uint<9> new_len = do_op ? (ap_uint<9>)(total - op_bits) : total;
-        if (new_len > 0)
-            leftover = do_op ? w.range(op_bits + new_len - 1, op_bits)
-                             : w.range(new_len - 1, 0);
-        leftover_len = new_len;
+        switch (lsel_cur) {
+            case 0:  w.range(127, 0) = cat.range(255, 128); break;
+            case 1:  w.range(143, 0) = cat.range(255, 112); break;
+            case 2:  w.range(159, 0) = cat.range(255,  96); break;
+            case 3:  w.range(175, 0) = cat.range(255,  80); break;
+            case 4:  w.range(191, 0) = cat.range(255,  64); break;
+            case 5:  w.range(207, 0) = cat.range(255,  48); break;
+            case 6:  w.range(223, 0) = cat.range(255,  32); break;
+            case 7:  w.range(239, 0) = cat.range(255,  16); break;
+            default: w = cat;                               break;
+        }
 
         if (do_op) {
 
-            /* ---- 取出 8 個 pixel（3 倍只用前 6 個） ---- */
-            ap_uint<24> p[8];
-#pragma HLS ARRAY_PARTITION variable=p complete
-            for (int j = 0; j < 8; j++) {
+            /* ---- 取出 8 個 pixel：px[j][k]（3 倍只用前 6 個）----
+             * 位置 [j*24 + k*8 + 7 : j*24 + k*8] */
+            ap_uint<8> px[8][3];
+#pragma HLS ARRAY_PARTITION variable=px complete dim=0
+
+            px_loop: for (ap_uint<4> j = 0; j < 8; j = ap_uint<4>(j) + ap_uint<4>(1)) {
 #pragma HLS UNROLL
-                p[j] = w.range(j * 24 + 23, j * 24);
-            }
-
-            /* ---- 水平方向加總，RGB 三通道並行 ----
-             * 3 倍：每 3 個 pixel 一組，共 2 組
-             * 2 倍：每 2 個 pixel 一組，共 4 組 */
-            ap_uint<10> h_r[4], h_g[4], h_b[4];
-#pragma HLS ARRAY_PARTITION variable=h_r complete
-#pragma HLS ARRAY_PARTITION variable=h_g complete
-#pragma HLS ARRAY_PARTITION variable=h_b complete
-
-            if (s3) {
-                h_r[0] = p[0].range( 7, 0) + p[1].range( 7, 0) + p[2].range( 7, 0);
-                h_g[0] = p[0].range(15, 8) + p[1].range(15, 8) + p[2].range(15, 8);
-                h_b[0] = p[0].range(23,16) + p[1].range(23,16) + p[2].range(23,16);
-
-                h_r[1] = p[3].range( 7, 0) + p[4].range( 7, 0) + p[5].range( 7, 0);
-                h_g[1] = p[3].range(15, 8) + p[4].range(15, 8) + p[5].range(15, 8);
-                h_b[1] = p[3].range(23,16) + p[4].range(23,16) + p[5].range(23,16);
-
-                h_r[2] = 0; h_g[2] = 0; h_b[2] = 0;
-                h_r[3] = 0; h_g[3] = 0; h_b[3] = 0;
-            } else {
-                for (int g = 0; g < 4; g++) {
+                ap_uint<9> base = ap_uint<4>(j) * ap_uint<5>(24);            /* <= 168 */
+                px_ch_loop: for (ap_uint<3> k = 0; k < 3; k = ap_uint<3>(k) + ap_uint<3>(1)) {
 #pragma HLS UNROLL
-                    h_r[g] = p[g*2].range( 7, 0) + p[g*2+1].range( 7, 0);
-                    h_g[g] = p[g*2].range(15, 8) + p[g*2+1].range(15, 8);
-                    h_b[g] = p[g*2].range(23,16) + p[g*2+1].range(23,16);
+                    ap_uint<6> off = ap_uint<2>(k) * ap_uint<4>(8);          /* <= 16  */
+                    ap_uint<9> lo  = ap_uint<8>(base) + ap_uint<8>(off);     /* <= 184 */
+                    ap_uint<9> hi  = ap_uint<8>(lo)   + ap_uint<8>(7);       /* <= 191 */
+                    px[j][k] = w.range(hi, lo);
                 }
             }
 
-            /* ---- 讀出四個 bank 的目前累加值 ---- */
-            // int base_idx = ox >> 2;
-            // int bsel     = ox & 3;          /* 3 倍時交替 0 / 2 */
+            /* ---- 讀出四個 bank ---- */
+            ap_uint<8> base_idx = ox.range(9, 2);    /* ox >> 2，<= 239 */
+            ap_uint<2> bsel     = ox.range(1, 0);    /* ox & 3，3 倍時交替 0 / 2 */
+            bool       alt      = s3 && (bsel != 0); /* 3 倍且輪到 bank2/3 */
 
-            // Max Out Image Width = 1023
-            ap_uint<10> base_idx = ox >> 2;
-            ap_uint<2>  bsel     = ox & 3;          /* 3 倍時交替 0 / 2 */
+            /* 每塊只讀一次 36-bit，切片是純接線，不消耗記憶體埠 */
+            ap_uint<PACKW> q[4];
+#pragma HLS ARRAY_PARTITION variable=q complete
+            q[0] = lb0[base_idx];
+            q[1] = lb1[base_idx];
+            q[2] = lb2[base_idx];
+            q[3] = lb3[base_idx];
 
-            /* 每塊只讀一次 36-bit，再用 range 切成三個 12-bit。
-             * 切片是純接線，不消耗記憶體埠。 */
-            ap_uint<PACKW> q0 = lb0[base_idx];
-            ap_uint<PACKW> q1 = lb1[base_idx];
-            ap_uint<PACKW> q2 = lb2[base_idx];
-            ap_uint<PACKW> q3 = lb3[base_idx];
+            /* cur[g][k]：位置 [k*12 + 11 : k*12] */
+            ap_uint<ACCW> cur[4][3];
+#pragma HLS ARRAY_PARTITION variable=cur complete dim=0
 
-            ap_uint<ACCW> c0_r = q0.range(ACCW-1, 0);
-            ap_uint<ACCW> c0_g = q0.range(ACCW*2-1, ACCW);
-            ap_uint<ACCW> c0_b = q0.range(ACCW*3-1, ACCW*2);
-            ap_uint<ACCW> c1_r = q1.range(ACCW-1, 0);
-            ap_uint<ACCW> c1_g = q1.range(ACCW*2-1, ACCW);
-            ap_uint<ACCW> c1_b = q1.range(ACCW*3-1, ACCW*2);
-            ap_uint<ACCW> c2_r = q2.range(ACCW-1, 0);
-            ap_uint<ACCW> c2_g = q2.range(ACCW*2-1, ACCW);
-            ap_uint<ACCW> c2_b = q2.range(ACCW*3-1, ACCW*2);
-            ap_uint<ACCW> c3_r = q3.range(ACCW-1, 0);
-            ap_uint<ACCW> c3_g = q3.range(ACCW*2-1, ACCW);
-            ap_uint<ACCW> c3_b = q3.range(ACCW*3-1, ACCW*2);
+            cur_loop: for (ap_uint<3> g = 0; g < 4; g = ap_uint<3>(g) + ap_uint<3>(1)) {
+#pragma HLS UNROLL
+                cur_ch_loop: for (ap_uint<3> k = 0; k < 3; k = ap_uint<3>(k) + ap_uint<3>(1)) {
+#pragma HLS UNROLL
+                    ap_uint<6> lo = ap_uint<2>(k) * ap_uint<4>(12);          /* <= 24 */
+                    ap_uint<6> hi = ap_uint<5>(lo) + ap_uint<5>(11);         /* <= 35 */
+                    cur[g][k] = q[g].range(hi, lo);
+                }
+            }
 
-            /* 3 倍模式：bsel=0 用 bank0/1，bsel=2 用 bank2/3
-             * 2 倍模式：bsel 恆 0，四個 bank 全用 */
-            ap_uint<ACCW> in0_r = s3 ? (bsel ? c2_r : c0_r) : c0_r;
-            ap_uint<ACCW> in0_g = s3 ? (bsel ? c2_g : c0_g) : c0_g;
-            ap_uint<ACCW> in0_b = s3 ? (bsel ? c2_b : c0_b) : c0_b;
-            ap_uint<ACCW> in1_r = s3 ? (bsel ? c3_r : c1_r) : c1_r;
-            ap_uint<ACCW> in1_g = s3 ? (bsel ? c3_g : c1_g) : c1_g;
-            ap_uint<ACCW> in1_b = s3 ? (bsel ? c3_b : c1_b) : c1_b;
+            bool last_row = (row_in_block == v_last);
 
-            /* ---- 累加 ---- */
-            ap_uint<ACCW> a0_r = in0_r + h_r[0], a0_g = in0_g + h_g[0], a0_b = in0_b + h_b[0];
-            ap_uint<ACCW> a1_r = in1_r + h_r[1], a1_g = in1_g + h_g[1], a1_b = in1_b + h_b[1];
-            ap_uint<ACCW> a2_r = c2_r  + h_r[2], a2_g = c2_g  + h_g[2], a2_b = c2_b  + h_b[2];
-            ap_uint<ACCW> a3_r = c3_r  + h_r[3], a3_g = c3_g  + h_g[3], a3_b = c3_b  + h_b[3];
+            /* DSP 的 B 埠：17 bit 無號，DSP48E2 的 18-bit 有號 B 埠放得下 */
+            ap_uint<17> mul_b = last_row ? ap_uint<17>(inv_scale) : ap_uint<17>(65536);
 
-            bool last_row = (row_in_block == v_taps - 1);
-
-            /* ---- 決定寫回值，最後統一寫入 ----
-             * 刻意不在兩個分支各自寫 BRAM，避免同一陣列出現
+            /* 刻意不在分支裡各自寫 BRAM，避免同一陣列出現
              * 兩個寫入點而被判定需要兩個寫埠（HLS 200-885） */
-            ap_uint<ACCW> w0_r = 0, w0_g = 0, w0_b = 0;
-            ap_uint<ACCW> w1_r = 0, w1_g = 0, w1_b = 0;
-            ap_uint<ACCW> w2_r = 0, w2_g = 0, w2_b = 0;
-            ap_uint<ACCW> w3_r = 0, w3_g = 0, w3_b = 0;
+            ap_uint<96>    res = 0;
+            ap_uint<PACKW> pk[4];
+#pragma HLS ARRAY_PARTITION variable=pk complete
 
-            if (last_row) {
-                /* 正規化：乘上倒數取代除法，inv_scale = 65536/(scale^2)
-                 *
-                 * BIND_OP 必須綁在具名變數上，不能直接對表達式下 pragma，
-                 * 故先把乘積存進 m?_? 再移位。
-                 * 六個（2 倍時十二個）乘法必須各自獨立佔用一顆 DSP，
-                 * 絕不可加 ALLOCATION limit 讓它們共用——那會強制序列化，
-                 * II=1 就保不住。 */
-                ap_uint<ACCW+16> m0_r = a0_r * inv_scale;
-#pragma HLS BIND_OP variable=m0_r op=mul impl=dsp
-                ap_uint<ACCW+16> m0_g = a0_g * inv_scale;
-#pragma HLS BIND_OP variable=m0_g op=mul impl=dsp
-                ap_uint<ACCW+16> m0_b = a0_b * inv_scale;
-#pragma HLS BIND_OP variable=m0_b op=mul impl=dsp
-                ap_uint<ACCW+16> m1_r = a1_r * inv_scale;
-#pragma HLS BIND_OP variable=m1_r op=mul impl=dsp
-                ap_uint<ACCW+16> m1_g = a1_g * inv_scale;
-#pragma HLS BIND_OP variable=m1_g op=mul impl=dsp
-                ap_uint<ACCW+16> m1_b = a1_b * inv_scale;
-#pragma HLS BIND_OP variable=m1_b op=mul impl=dsp
+            grp_loop: for (ap_uint<3> g = 0; g < 4; g = ap_uint<3>(g) + ap_uint<3>(1)) {
+#pragma HLS UNROLL
+                ap_uint<8> rbase = ap_uint<3>(g) * ap_uint<5>(24);           /* <= 72 */
+                pk[g] = 0;
 
-                ap_uint<8> o0_r = (ap_uint<8>)(m0_r >> 16);
-                ap_uint<8> o0_g = (ap_uint<8>)(m0_g >> 16);
-                ap_uint<8> o0_b = (ap_uint<8>)(m0_b >> 16);
-                ap_uint<8> o1_r = (ap_uint<8>)(m1_r >> 16);
-                ap_uint<8> o1_g = (ap_uint<8>)(m1_g >> 16);
-                ap_uint<8> o1_b = (ap_uint<8>)(m1_b >> 16);
+                grp_ch_loop: for (ap_uint<3> k = 0; k < 3; k = ap_uint<3>(k) + ap_uint<3>(1)) {
+#pragma HLS UNROLL
+                    /* ---- 本組的 bank 舊值 ---- */
+                    ap_uint<ACCW> prev;
+                    if      (g == 0) prev = alt ? cur[2][k] : cur[0][k];
+                    else if (g == 1) prev = alt ? cur[3][k] : cur[1][k];
+                    else             prev = cur[g][k];
 
-                ap_uint<96> res = 0;
-                res.range(23,  0) = ((ap_uint<24>)o0_b << 16)
-                                  | ((ap_uint<24>)o0_g <<  8) | (ap_uint<24>)o0_r;
-                res.range(47, 24) = ((ap_uint<24>)o1_b << 16)
-                                  | ((ap_uint<24>)o1_g <<  8) | (ap_uint<24>)o1_r;
+                    /* ---- 本組的三個 pixel ---- */
+                    ap_uint<8> x, y, z;
+                    if (g == 0) {
+                        x = px[0][k];
+                        y = px[1][k];
+                        z = s3 ? px[2][k] : ap_uint<8>(0);
+                    } else if (g == 1) {
+                        x = s3 ? px[3][k] : px[2][k];
+                        y = s3 ? px[4][k] : px[3][k];
+                        z = s3 ? px[5][k] : ap_uint<8>(0);
+                    } else if (g == 2) {
+                        x = px[4][k];
+                        y = px[5][k];
+                        z = 0;
+                    } else {
+                        x = px[6][k];
+                        y = px[7][k];
+                        z = 0;
+                    }
 
-                if (!s3) {
-                    ap_uint<ACCW+16> m2_r = a2_r * inv_scale;
-#pragma HLS BIND_OP variable=m2_r op=mul impl=dsp
-                    ap_uint<ACCW+16> m2_g = a2_g * inv_scale;
-#pragma HLS BIND_OP variable=m2_g op=mul impl=dsp
-                    ap_uint<ACCW+16> m2_b = a2_b * inv_scale;
-#pragma HLS BIND_OP variable=m2_b op=mul impl=dsp
-                    ap_uint<ACCW+16> m3_r = a3_r * inv_scale;
-#pragma HLS BIND_OP variable=m3_r op=mul impl=dsp
-                    ap_uint<ACCW+16> m3_g = a3_g * inv_scale;
-#pragma HLS BIND_OP variable=m3_g op=mul impl=dsp
-                    ap_uint<ACCW+16> m3_b = a3_b * inv_scale;
-#pragma HLS BIND_OP variable=m3_b op=mul impl=dsp
+                    /* A：11b + 11b -> 12b
+                     *    舊值最大 1530（3 倍 2 列 x 765），+255 = 1785 < 2048 */
+                    ap_uint<12> pre_a = ap_uint<11>(prev) + ap_uint<11>(x);
 
-                    ap_uint<8> o2_r = (ap_uint<8>)(m2_r >> 16);
-                    ap_uint<8> o2_g = (ap_uint<8>)(m2_g >> 16);
-                    ap_uint<8> o2_b = (ap_uint<8>)(m2_b >> 16);
-                    ap_uint<8> o3_r = (ap_uint<8>)(m3_r >> 16);
-                    ap_uint<8> o3_g = (ap_uint<8>)(m3_g >> 16);
-                    ap_uint<8> o3_b = (ap_uint<8>)(m3_b >> 16);
+                    /* D：8b + 8b -> 9b，最大 510（g2/g3 的 z 恆 0，加法會被折疊） */
+                    ap_uint<9>  pre_d = ap_uint<8>(y) + ap_uint<8>(z);
 
-                    res.range(71, 48) = ((ap_uint<24>)o2_b << 16)
-                                      | ((ap_uint<24>)o2_g <<  8) | (ap_uint<24>)o2_r;
-                    res.range(95, 72) = ((ap_uint<24>)o3_b << 16)
-                                      | ((ap_uint<24>)o3_g <<  8) | (ap_uint<24>)o3_r;
+                    ap_uint<8>  o_val;    /* 正規化後輸出 */
+                    ap_uint<12> s_val;    /* 寫回 BRAM 的累加值 */
+
+                    if (g < 2) {
+                        /* ---- g0/g1：走 DSP ----
+                         * (A + D) * B，寫在同一個運算式才會吸收 pre-adder
+                         *   A + D：11b + 11b -> 12b，最大 2295
+                         *   * B  ：12b x 17b -> 29b，最大 2295 x 65536
+                         * 各自獨立佔用一顆 DSP，勿加 ALLOCATION limit */
+                        ap_uint<29> m = ap_uint<12>(ap_uint<11>(pre_a) + ap_uint<11>(pre_d))
+                                      * ap_uint<17>(mul_b);
+#pragma HLS BIND_OP variable=m op=mul impl=dsp
+                        o_val = m.range(23, 16);
+                        s_val = m.range(27, 16);
+                    } else {
+                        /* ---- g2/g3：只有 2 倍會用到，不需要 DSP ----
+                         *   A + D：11b + 11b -> 12b，2 倍最大 4 x 255 = 1020
+                         *   /4 即取 [9:2]
+                         * 3 倍時這兩組的結果不會被使用 */
+                        ap_uint<12> s = ap_uint<11>(pre_a) + ap_uint<11>(pre_d);
+                        o_val = s.range(9, 2);
+                        s_val = s;
+                    }
+
+                    /* ---- 輸出：[g*24 + k*8 + 7 : g*24 + k*8] ----
+                     * 3 倍時 g2/g3 為無效值，pack_side 只取低 48 bit */
+                    ap_uint<6> ooff = ap_uint<2>(k) * ap_uint<4>(8);          /* <= 16 */
+                    ap_uint<8> olo  = ap_uint<7>(rbase) + ap_uint<7>(ooff);   /* <= 88 */
+                    ap_uint<8> ohi  = ap_uint<7>(olo)   + ap_uint<7>(7);      /* <= 95 */
+                    res.range(ohi, olo) = o_val;
+
+                    /* ---- 寫回值：[k*12 + 11 : k*12]，last_row 時歸零 ---- */
+                    ap_uint<6> wlo = ap_uint<2>(k) * ap_uint<4>(12);          /* <= 24 */
+                    ap_uint<6> whi = ap_uint<5>(wlo) + ap_uint<5>(11);        /* <= 35 */
+                    pk[g].range(whi, wlo) = last_row ? ap_uint<12>(0) : s_val;
                 }
-
-                /* 送進 FIFO，位元累積與 AXI 寫出交給後續兩段處理 */
-                result_out.write(res);
-
-                /* last_row 時全部歸零，w?_* 保持宣告時的 0 */
-
-            } else {
-                w0_r = a0_r; w0_g = a0_g; w0_b = a0_b;
-                w1_r = a1_r; w1_g = a1_g; w1_b = a1_b;
-                w2_r = a2_r; w2_g = a2_g; w2_b = a2_b;
-                w3_r = a3_r; w3_g = a3_g; w3_b = a3_b;
             }
 
-            /* ---- 打包回 36-bit ---- */
-            ap_uint<PACKW> p0 = ((ap_uint<PACKW>)w0_b << (ACCW*2))
-                              | ((ap_uint<PACKW>)w0_g << ACCW)
-                              |  (ap_uint<PACKW>)w0_r;
-            ap_uint<PACKW> p1 = ((ap_uint<PACKW>)w1_b << (ACCW*2))
-                              | ((ap_uint<PACKW>)w1_g << ACCW)
-                              |  (ap_uint<PACKW>)w1_r;
-            ap_uint<PACKW> p2 = ((ap_uint<PACKW>)w2_b << (ACCW*2))
-                              | ((ap_uint<PACKW>)w2_g << ACCW)
-                              |  (ap_uint<PACKW>)w2_r;
-            ap_uint<PACKW> p3 = ((ap_uint<PACKW>)w3_b << (ACCW*2))
-                              | ((ap_uint<PACKW>)w3_g << ACCW)
-                              |  (ap_uint<PACKW>)w3_r;
+            /* 送進 FIFO，位元累積與 AXI 寫出交給後續兩段處理 */
+            if (last_row)
+                result_out.write(res);
 
             /* ---- 寫回：每塊陣列最多一次寫入 ---- */
             if (s3) {
                 if (bsel) {
-                    lb2[base_idx] = p0;
-                    lb3[base_idx] = p1;
+                    lb2[base_idx] = pk[0];
+                    lb3[base_idx] = pk[1];
                 } else {
-                    lb0[base_idx] = p0;
-                    lb1[base_idx] = p1;
+                    lb0[base_idx] = pk[0];
+                    lb1[base_idx] = pk[1];
                 }
             } else {
-                lb0[base_idx] = p0;
-                lb1[base_idx] = p1;
-                lb2[base_idx] = p2;
-                lb3[base_idx] = p3;
+                lb0[base_idx] = pk[0];
+                lb1[base_idx] = pk[1];
+                lb2[base_idx] = pk[2];
+                lb3[base_idx] = pk[3];
             }
 
-            ox += n_out;
-            if (ox >= out_w) {
+            /* ox + n_out：10b + 10b -> 11b，最大 958 + 2 = 960 */
+            ap_uint<11> ox_next = ap_uint<10>(ox) + ap_uint<10>(n_out);
+            if (ox_next >= out_w) {
                 ox = 0;
-                row_in_block++;
+                /* row_in_block + 1：最大 2 + 1 = 3，2 bit 足夠 */
+                row_in_block = ap_uint<2>(row_in_block) + ap_uint<2>(1);
                 if (row_in_block == v_taps)
                     row_in_block = 0;
+            } else {
+                ox = ox_next.range(9, 0);
             }
         }
     }
@@ -406,44 +441,54 @@ static void compute_side(ap_uint<128>                  *in_ptr,
  *  這段仍有條件判斷，但只碰 FIFO 不碰 AXI，
  *  burst inference 不受影響。
  *
- *  殘餘序列：3 倍 {16,8,0}、2 倍 {16,32,0}
+ *  acc_len 在每次迭代開始時恆 < 128（7 bit）
+ *  殘餘序列：3 倍 {48,96,16,64,112,32,80,0}、2 倍 {96,64,32,0}
  * ================================================================ */
 
-static void pack_side(hls::stream<ap_uint<96> >  &result_in,
-                      hls::stream<ap_uint<128> > &word_out,
-                      ap_uint<LOG2_CEIL(OUT_DEPTH)> total_results,
-                      ap_uint<1>                  scale_mode)
+static void pack_side(hls::stream<ap_uint<96> >    &result_in,
+                      hls::stream<ap_uint<128> >   &word_out,
+                      ap_uint<LOG2_CEIL(RES_MAX)>  total_results,
+                      ap_uint<1>                   scale_mode)
 {
     ap_uint<224> acc     = 0;   /* 最壞 127 + 96 = 223 bit */
-    ap_uint<8>   acc_len = 0;
+    ap_uint<7>   acc_len = 0;   /* 0..127 */
 
-    const ap_uint<8> res_bits = (scale_mode == SCALE_3)
-                              ? (ap_uint<8>)48 : (ap_uint<8>)96;
+    const ap_uint<7> res_bits = (scale_mode == SCALE_3)
+                              ? (ap_uint<7>)48 : (ap_uint<7>)96;
+    /* res_bits - 1：47 或 95 */
+    const ap_uint<7> res_hi   = ap_uint<7>(res_bits) - ap_uint<7>(1);
 
-    // pack_loop: for (int r = 0; r < total_results; r++) {
-    pack_loop: for (ap_uint<FOR_IDX_BITS(OUT_DEPTH)> r = 0; r < total_results; r++) {
+    pack_loop: for (pack_idx_t r = 0; r < total_results; r = pack_idx_t(r) + pack_idx_t(1)) {
 #pragma HLS PIPELINE II=1
-#pragma HLS LOOP_TRIPCOUNT min=1 max=OUT_DEPTH
+#pragma HLS LOOP_TRIPCOUNT min=1 max=RES_MAX
 
         ap_uint<96> res = result_in.read();
 
-        acc.range(acc_len + res_bits - 1, acc_len) = res.range(res_bits - 1, 0);
-        acc_len += res_bits;
+        /* acc_len + res_bits：7b + 7b -> 8b，最大 127 + 96 = 223 */
+        ap_uint<8> sum_len = ap_uint<7>(acc_len) + ap_uint<7>(res_bits);
+        /* sum_len - 1：最大 222 */
+        ap_uint<8> sum_hi  = ap_uint<8>(sum_len) - ap_uint<8>(1);
 
-        if (acc_len >= 128) {
+        acc.range(sum_hi, acc_len) = res.range(res_hi, 0);
+
+        if (sum_len >= 128) {
             word_out.write(acc.range(127, 0));
 
-            ap_uint<8> rem_len = acc_len - 128;
+            /* sum_len - 128：最大 95 */
+            ap_uint<7> rem_len = ap_uint<8>(sum_len) - ap_uint<8>(128);
 
             /* rem_len 為 0 時 range(-1,0) 是未定義行為，必須 guard */
             if (rem_len > 0) {
-                ap_uint<96> rem = acc.range(acc_len - 1, 128);
+                ap_uint<96> rem    = acc.range(sum_hi, 128);
+                ap_uint<7>  rem_hi = ap_uint<7>(rem_len) - ap_uint<7>(1);
                 acc = 0;
-                acc.range(rem_len - 1, 0) = rem;
+                acc.range(rem_hi, 0) = rem;
             } else {
                 acc = 0;
             }
             acc_len = rem_len;
+        } else {
+            acc_len = sum_len.range(6, 0);   /* 此分支 sum_len < 128 */
         }
     }
 
@@ -458,17 +503,15 @@ static void pack_side(hls::stream<ap_uint<96> >  &result_in,
 /* ================================================================
  *  第三段：AXI 寫出
  *
- *  這一段存在的唯一理由是讓 burst inference 成立。
  *  迴圈只做「讀 FIFO、寫 DDR」，位址是純粹的迴圈變數 i，
  *  沒有任何條件包裹——這是 burst inference 最理想的形式。
  * ================================================================ */
 
-static void axi_write_side(hls::stream<ap_uint<128> > &word_in,
-                           ap_uint<128>               *out_ptr,
-                           ap_uint<LOG2_CEIL(OUT_DEPTH)>  out_words)
+static void axi_write_side(hls::stream<ap_uint<128> >    &word_in,
+                           ap_uint<128>                  *out_ptr,
+                           ap_uint<LOG2_CEIL(OUT_DEPTH)> out_words)
 {
-    // write_loop: for (int i = 0; i < out_words; i++) {
-    write_loop: for (ap_uint<FOR_IDX_BITS(OUT_DEPTH)> i = 0; i < out_words; i++) {
+    write_loop: for (wr_idx_t i = 0; i < out_words; i = wr_idx_t(i) + wr_idx_t(1)) {
 #pragma HLS PIPELINE II=1
 #pragma HLS LOOP_TRIPCOUNT min=1 max=OUT_DEPTH
         out_ptr[i] = word_in.read();
@@ -512,13 +555,15 @@ void resize_kernel(ap_uint<128> *in_ptr,
 #pragma HLS BIND_STORAGE variable=result_ch type=fifo impl=srl
 #pragma HLS BIND_STORAGE variable=word_ch   type=fifo impl=srl
 
-    // compute_side  (in_ptr, result_ch, total_words, out_w, scale_mode, inv_scale);
-    // pack_side     (result_ch, word_ch, total_results, scale_mode);
-    // axi_write_side(word_ch, out_ptr, out_words);
+    /* 32-bit 暫存器截成各段實際需要的寬度，slice 寬度需與參數型別一致 */
+    ap_uint<LOG2_CEIL(IN_DEPTH)>  tw = total_words  .range(LOG2_CEIL(IN_DEPTH)  - 1, 0);
+    ap_uint<LOG2_CEIL(OUT_W_MAX)> ow = out_w        .range(LOG2_CEIL(OUT_W_MAX) - 1, 0);
+    ap_uint<LOG2_CEIL(RES_MAX)>   tr = total_results.range(LOG2_CEIL(RES_MAX)   - 1, 0);
+    ap_uint<LOG2_CEIL(OUT_DEPTH)> wn = out_words    .range(LOG2_CEIL(OUT_DEPTH) - 1, 0);
 
-    compute_side  (in_ptr, result_ch, total_words.range(LOG2_CEIL(IN_DEPTH)-1,0), out_w.range(LOG2_CEIL(OUT_DEPTH)-1,0), scale_mode, inv_scale);
-    pack_side     (result_ch, word_ch, total_results.range(LOG2_CEIL(OUT_DEPTH)-1,0), scale_mode);
-    axi_write_side(word_ch, out_ptr, out_words.range(LOG2_CEIL(OUT_DEPTH)-1,0));
+    compute_side  (in_ptr, result_ch, tw, ow, scale_mode, inv_scale);
+    pack_side     (result_ch, word_ch, tr, scale_mode);
+    axi_write_side(word_ch, out_ptr, wn);
 }
 
 
@@ -539,7 +584,7 @@ void resize_kernel(ap_uint<128> *in_ptr,
  *     out_words     = 960 * 540 * 3 / 16   = 97200
  *     out_w         = 960    （必須是 4 的倍數）
  *     scale_mode    = SCALE_2
- *     inv_scale     = 65536 / 4 = 16384
+ *     inv_scale     = 65536 / 4 = 16384   （g0/g1 的 DSP 仍會用到）
  *
  *
  * 效能預期
@@ -553,17 +598,15 @@ void resize_kernel(ap_uint<128> *in_ptr,
  *   1. 三個迴圈的 Interval 皆為 1
  *      main_loop / pack_loop / write_loop
  *
- *   2. DSP = 12（三通道 x 四組輸出）
- *      已用 BIND_OP impl=dsp 明確綁定，report 的 DSP 欄應為 12。
+ *   2. DSP = 6（g0/g1 x 三通道）
+ *      Vivado synth 後查 DSP cell：AMULTSEL = AD 代表 pre-adder 已吸收；
+ *      若為 A，代表 A+D 仍在 fabric。
  *      切勿加 ALLOCATION instances=mul limit=N，那會強制共用、破壞 II=1。
  *
  *   2b. BRAM：4 塊 line buffer，每塊 out_w/4 x 36 bit
  *      若 report 顯示 12 顆，代表 RGB 打包沒生效
  *
  *   3. console 出現 in_ptr 與 out_ptr 的 burst inferred 訊息
- *      特別確認 gmem1：write_loop 現在是純粹的
- *          out_ptr[i] = word_in.read();
- *      位址即迴圈變數、無條件包裹，應該必定成立。
  *
  *   4. co-sim 的 main_loop Iteration Max II 應接近 1
  *      （synthesis 的 II=1 只是排程結果，co-sim 才反映 AXI 實際延遲）
@@ -571,7 +614,7 @@ void resize_kernel(ap_uint<128> *in_ptr,
  *
  * C simulation 驗證
  *
- *   印出 leftover_len 序列比對：
+ *   印出 lsel * 16（即 leftover_len）序列比對：
  *     3 倍應走 {128,112,96,80,64,48,32,16,0} 週期 9
  *     2 倍應走 {128,64,0}                    週期 3
  *   第一批 do_op 必為 0（128 < 144），這是正常暖機
