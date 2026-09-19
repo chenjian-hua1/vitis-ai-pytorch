@@ -338,9 +338,9 @@ void uyvy2rgb(ap_uint<128> *uyvy_axi_bus, ap_uint<128> *rgb_axi_bus,
 
     // ---- AXI4 master: 兩個獨立 bundle，讀寫才能同時進行 ----
 #pragma HLS INTERFACE m_axi port=uyvy_axi_bus offset=slave bundle=gmem0 \
-                     depth=MAX_IN max_read_burst_length=16 num_read_outstanding=8
+                     depth=MAX_IN max_read_burst_length=128 num_read_outstanding=2                  
 #pragma HLS INTERFACE m_axi port=rgb_axi_bus  offset=slave bundle=gmem1 \
-                     depth=MAX_OUT max_write_burst_length=16 num_write_outstanding=8
+                     depth=MAX_OUT max_write_burst_length=128 num_write_outstanding=2
 
     // ---- AXI4-Lite: 位址與純量參數 ----
 #pragma HLS INTERFACE s_axilite port=uyvy_axi_bus bundle=control
@@ -351,8 +351,11 @@ void uyvy2rgb(ap_uint<128> *uyvy_axi_bus, ap_uint<128> *rgb_axi_bus,
 
 #pragma HLS DATAFLOW
 
-    ap_uint<32> in_beats  = (ap_uint<32>(img_w) >> 3) * ap_uint<32>(img_h);
-    ap_uint<32> out_beats = in_beats + (in_beats >> 1);      // x1.5
+    ap_uint<32> in_beats = (ap_uint<32>(img_w) >> 3) * ap_uint<32>(img_h);
+#pragma HLS BIND_OP variable=in_beats op=mul impl=dsp latency=3
+
+    ap_uint<32> half      = in_beats >> 1;
+    ap_uint<32> out_beats = in_beats + half;
 
     hls::stream<ap_uint<192> > pix_fifo;
 #pragma HLS STREAM        variable=pix_fifo depth=16
