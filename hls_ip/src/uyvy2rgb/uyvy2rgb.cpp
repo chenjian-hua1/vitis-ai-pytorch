@@ -171,7 +171,7 @@ static void cvt_pair(ap_uint<8> y0, ap_uint<8> y1,
     d_w.range( 8,  0) = d_wlo.range(8, 0);
 
     dsp_acc_t d_b = 0;
-    d_b[18] = d[7];                          // <-- 借位補償，一條線，零 LUT
+    d_b[18] = d[7];                          // <-- 高位2補時補1，一條線，零 LUT
 
     dsp_acc_t d_acc;
     mac(d_w, d_x, d_b, d_acc);
