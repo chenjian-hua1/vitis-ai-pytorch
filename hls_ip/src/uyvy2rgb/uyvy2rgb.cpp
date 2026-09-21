@@ -338,9 +338,9 @@ void uyvy2rgb(ap_uint<128> *uyvy_axi_bus, ap_uint<128> *rgb_axi_bus,
 
     // ---- AXI4 master: 兩個獨立 bundle，讀寫才能同時進行 ----
 #pragma HLS INTERFACE m_axi port=uyvy_axi_bus offset=slave bundle=gmem0 \
-                     depth=MAX_IN max_read_burst_length=128 num_read_outstanding=2                  
+                     depth=MAX_IN max_read_burst_length=128 num_read_outstanding=4                  
 #pragma HLS INTERFACE m_axi port=rgb_axi_bus  offset=slave bundle=gmem1 \
-                     depth=MAX_OUT max_write_burst_length=128 num_write_outstanding=2
+                     depth=MAX_OUT max_write_burst_length=128 num_write_outstanding=4
 
     // ---- AXI4-Lite: 位址與純量參數 ----
 #pragma HLS INTERFACE s_axilite port=uyvy_axi_bus bundle=control
