@@ -1,8 +1,10 @@
 // =====================================================================
 //  tb_uyvy2rgb.cpp  --  csim / cosim 共用的 testbench
 //
-//  Vitis HLS 在編譯 cosim 用的 C testbench 時會定義 COSIM_MODE，
-//  本檔用它自動分流:
+//  用 COSIM_MODE 分流 (自訂巨集，由 tcl 傳入):
+//      add_files -tb tb_uyvy2rgb.cpp -cflags "-DCOSIM_MODE"   (cosim)
+//      add_files -tb tb_uyvy2rgb.cpp                          (csim)
+//
 //      csim  : 跑完整測試 (窮舉、隨機、多種圖樣)
 //      cosim : 只跑必要的部分，縮短 RTL 模擬時間
 //
@@ -11,12 +13,8 @@
 //  必須「剛好等於」depth，而且每次呼叫都一樣大。本檔固定配置 MAX_IN /
 //  MAX_OUT，小圖只用前面一段。depth 對不上會在 ENTER_WRAPC 階段 SIGSEGV。
 //
-//      #pragma HLS INTERFACE m_axi port=uyvy_axi_bus ... depth=512
-//      #pragma HLS INTERFACE m_axi port=rgb_axi_bus  ... depth=768
-//
-//  csim 編譯:
-//    g++ -O2 -std=c++14 -I$XILINX_HLS/include \
-//        tb_uyvy2rgb.cpp uyvy2rgb.cpp -o tb && ./tb
+//      #pragma HLS INTERFACE m_axi port=uyvy_axi_bus ... depth=MAX_IN
+//      #pragma HLS INTERFACE m_axi port=rgb_axi_bus  ... depth=MAX_OUT
 // =====================================================================
 
 #include "uyvy2rgb.h"
@@ -27,6 +25,24 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+
+// ---------------------------------------------------------------------
+//  測試影像上限 —— 若 uyvy2rgb.h 已定義就沿用
+//  MAX_IN  = (MAX_IMG_W/8) * MAX_IMG_H  必須等於 gmem0 的 depth
+//  MAX_OUT = MAX_IN * 3/2               必須等於 gmem1 的 depth
+// ---------------------------------------------------------------------
+#ifndef MAX_IMG_W
+#define MAX_IMG_W 128
+#endif
+#ifndef MAX_IMG_H
+#define MAX_IMG_H 32
+#endif
+#ifndef MAX_IN
+#define MAX_IN   ((size_t)(MAX_IMG_W / 8) * MAX_IMG_H)       // 512
+#endif
+#ifndef MAX_OUT
+#define MAX_OUT  (MAX_IN * 3 / 2)                            // 768
+#endif
 
 // 容許誤差 (LSB)。8-bit 權重量化下實測最大 1，留 2 當緩衝。
 static const int TOL = 2;
@@ -89,20 +105,21 @@ static int test_subtract_128() {
 }
 
 // =====================================================================
-//  [2] clamp_ofs  (輸入 v 代表真值 v-256)
+//  [2] clamp_s  (有號輸入，直接代表真值，不含偏移)
+//      ap_int<10> 全範圍 -512 ~ 511，期望 clamp(v, 0, 255)
 // =====================================================================
-static int test_clamp_ofs() {
-    std::printf("[2] clamp_ofs 全範圍 (0~1023)\n");
+static int test_clamp_s() {
+    std::printf("[2] clamp_s 全範圍 (-512~511)\n");
     int fail = 0;
-    for (int i = 0; i < 1024; i++) {
-        ap_uint<10> v = (ap_uint<10>)i;
-        ap_uint<8>  o = 0;
-        clamp_ofs(v, o);
-        int expect = i - 256;
-        expect = expect < 0 ? 0 : (expect > 255 ? 255 : expect);
+    for (int i = -512; i < 512; i++) {
+        ap_int<10> v = (ap_int<10>)i;
+        ap_uint<8> o = 0;
+        clamp_s(v, o);
+        int expect = i < 0 ? 0 : (i > 255 ? 255 : i);
         if ((int)o != expect) {
             if (fail < 8)
-                std::printf("    v=%4d got=%3d expect=%3d  FAIL\n", i, (int)o, expect);
+                std::printf("    v=%4d (bits[9:8]=%d%d) got=%3d expect=%3d  FAIL\n",
+                            i, (int)v[9], (int)v[8], (int)o, expect);
             fail++;
         }
     }
@@ -170,6 +187,8 @@ static int test_cvt_core() {
         { 128, 129, 127, "D=+1 E=-1"   },
         { 128,   0,   0, "D=E=-128"    },
         { 128, 255, 255, "D=E=+127"    },
+        {   0,   0, 255, "B/R 負向最深" },   // 打 clamp_s 的 bits[9:8]=11
+        { 255, 255,   0, "B 正向最高"   },   // 打 clamp_s 的 bits[9:8]=01
     };
     Stats sd;
     std::printf("  定向向量\n");
@@ -237,6 +256,8 @@ static int test_chained() {
 
 // =====================================================================
 //  [5] uyvy2rgb 整張影像  (csim / cosim 都跑)
+//      頂層走的是 cvt_pair (C port 一條線補償借位)，跟 cvt_core 不同路徑，
+//      所以這一項才是真正驗證合成對象的測試
 // =====================================================================
 enum Pattern { PAT_RAMP, PAT_BARS, PAT_RANDOM, PAT_EXTREME, PAT_MIXED };
 
@@ -327,10 +348,18 @@ static int test_frame(int w, int h, Pattern pat, const char *name) {
             fail++;
         }
     }
+
+    // 檢查輸出區尾端沒被多寫 (leftover 狀態機若多跑一拍會踩到這裡)
+    int overrun = 0;
+    for (size_t k = out_beats; k < MAX_OUT; k++)
+        if (out_mem[k] != (ap_uint<128>)0xDEAD) overrun++;
+
     std::printf("  %-10s %4dx%-4d  %6zu pixel  maxErr=%d  %s\n",
-                name, w, h, (size_t)w * h, maxErr, fail ? "FAIL" : "ok");
-    if (fail) std::printf("             %d 個 pixel 超出容許誤差\n", fail);
-    return fail;
+                name, w, h, (size_t)w * h, maxErr,
+                (fail || overrun) ? "FAIL" : "ok");
+    if (fail)    std::printf("             %d 個 pixel 超出容許誤差\n", fail);
+    if (overrun) std::printf("             %d 個 beat 寫超過 out_beats\n", overrun);
+    return fail + overrun;
 }
 
 static int test_top() {
@@ -339,14 +368,14 @@ static int test_top() {
     int fail = 0;
 
 #ifdef COSIM_MODE
-    // cosim: 一張混合圖樣的小圖就夠，RTL 模擬時間才不會爆
-    // fail += test_frame(64, 16, PAT_MIXED, "mixed");
+    // cosim: 一張混合圖樣就夠，RTL 模擬時間才不會爆
     fail += test_frame(MAX_IMG_W, MAX_IMG_H, PAT_MIXED, "mixed");
 #else
     fail += test_frame( 16,  4, PAT_EXTREME, "extreme");
     fail += test_frame( 32,  8, PAT_BARS,    "colorbar");
     fail += test_frame( 64, 16, PAT_RAMP,    "ramp");
-    fail += test_frame(128, 32, PAT_RANDOM,  "random");
+    fail += test_frame(MAX_IMG_W, MAX_IMG_H, PAT_RANDOM, "random");
+    fail += test_frame(MAX_IMG_W, MAX_IMG_H, PAT_MIXED,  "mixed");
 #endif
 
     std::printf("\n");
@@ -362,12 +391,12 @@ int main() {
     std::printf("(csim mode)\n");
 #endif
     std::printf("=== uyvy2rgb testbench ===\n");
-    std::printf("    TOL = %d LSB,  MAX_IN = %zu,  MAX_OUT = %zu\n\n",
-                TOL, MAX_IN, MAX_OUT);
+    std::printf("    TOL = %d LSB,  MAX_IMG = %dx%d,  MAX_IN = %zu,  MAX_OUT = %zu\n\n",
+                TOL, MAX_IMG_W, MAX_IMG_H, (size_t)MAX_IN, (size_t)MAX_OUT);
 
     int f = 0;
     f += test_subtract_128();
-    f += test_clamp_ofs();
+    f += test_clamp_s();
 
 #ifndef COSIM_MODE
     // 這兩項是純 C 的單元測試，跟 RTL 無關，cosim 跑只是浪費時間

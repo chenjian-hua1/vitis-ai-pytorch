@@ -333,15 +333,9 @@ void uyvy2rgb(ap_uint<128> *uyvy_axi_bus, ap_uint<128> *rgb_axi_bus,
               ap_uint<12> img_w, ap_uint<12> img_h) {
 
 #pragma HLS INTERFACE m_axi port=uyvy_axi_bus offset=slave bundle=gmem0 \
-<<<<<<< HEAD
                      depth=MAX_IN max_read_burst_length=128 num_read_outstanding=4                  
 #pragma HLS INTERFACE m_axi port=rgb_axi_bus  offset=slave bundle=gmem1 \
                      depth=MAX_OUT max_write_burst_length=128 num_write_outstanding=4
-=======
-                     depth=512 max_read_burst_length=128 num_read_outstanding=4
-#pragma HLS INTERFACE m_axi port=rgb_axi_bus  offset=slave bundle=gmem1 \
-                     depth=768 max_write_burst_length=128 num_write_outstanding=4
->>>>>>> f9e3e96e1be30874cd55399f0117d5d51c15ced8
 
 #pragma HLS INTERFACE s_axilite port=uyvy_axi_bus bundle=control
 #pragma HLS INTERFACE s_axilite port=rgb_axi_bus  bundle=control

@@ -94,6 +94,8 @@ void mac(dsp_w_t &w, dsp_x_t &x, dsp_acc_t &b, dsp_acc_t &acc);
 // 有效輸出對應 v[9:8] == 01，所以只是 2-bit 解碼。
 void clamp_ofs(ap_uint<10> &v, ap_uint<8> &out);
 
+void clamp_s(ap_int<10> &v, ap_uint<8> &out);
+
 // 單一 pixel 轉換 (unit test 用；頂層走的是 cvt_pair)
 //   d = U-128, e = V-128, pixel = {R[23:16], G[15:8], B[7:0]}
 void cvt_core(ap_uint<8> &y, ap_int<8> &d, ap_int<8> &e, ap_uint<24> &pixel);
@@ -109,12 +111,5 @@ void cvt_core(ap_uint<8> &y, ap_int<8> &d, ap_int<8> &e, ap_uint<24> &pixel);
 // Max 4096x4096
 void uyvy2rgb(ap_uint<128> *uyvy_axi_bus, ap_uint<128> *rgb_axi_bus,
               ap_uint<12> img_w, ap_uint<12> img_h);
-
-// ---------------------------------------------------------------------
-//  已停用
-// ---------------------------------------------------------------------
-// clamp_0_255 被 clamp_ofs 取代。後者不需要獨立的 sign 輸入，
-// 也不需要 in[9]|in[8] 的溢位比較。若舊碼還在引用可暫時保留宣告:
-// void clamp_0_255(ap_uint<10> &in, bool &sign, ap_uint<8> &out);
 
 #endif // UYVY2RGB_H
