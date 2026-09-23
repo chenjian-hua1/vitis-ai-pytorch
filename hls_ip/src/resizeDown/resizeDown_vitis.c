@@ -29,7 +29,15 @@
 #include "platform.h"
 #include "xil_printf.h"
 #include "xil_cache.h"
-#include "xtime_l.h"
+// 計時: SDT flow (Vitis 2023.2+) 把 xtime_l.h 換成 xiltimer 函式庫。
+// 需要在 platform 的 standalone domain 裡啟用 xiltimer (見檔尾說明)。
+#ifdef SDT
+  #include "xiltimer.h"
+  #include "sleep.h"
+#else
+  #include "xtime_l.h"
+  #include "sleep.h"
+#endif
 #include "xparameters.h"
 #include "xresize_kernel.h"
 

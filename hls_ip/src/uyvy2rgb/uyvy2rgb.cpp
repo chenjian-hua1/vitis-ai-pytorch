@@ -149,7 +149,7 @@ void cvt_core(ap_uint<8> &y, ap_int<8> &d, ap_int<8> &e, ap_uint<24> &pixel) {
 static void cvt_pair(ap_uint<8> y0, ap_uint<8> y1,
                      ap_uint<8> u,  ap_uint<8> v,
                      ap_uint<24> &px0, ap_uint<24> &px1) {
-#pragma HLS INLINE off
+// #pragma HLS INLINE off
     uvy_w_t d_wlo = 1.772, d_whi = 0.344136, e_wlo = 1.402, e_whi = 0.714136;
 
     ap_int<8> d, e;
@@ -239,7 +239,7 @@ PIX: for (int k = 0; k < 2; k++) {
 //  想要 BGR 的話直接回傳 p 不要換位
 // ---------------------------------------------------------------------
 static inline ap_uint<24> to_mem(ap_uint<24> p) {
-#pragma HLS INLINE
+// #pragma HLS INLINE
     ap_uint<24> m;
     m.range( 7,  0) = p.range(23, 16);   // R
     m.range(15,  8) = p.range(15,  8);   // G

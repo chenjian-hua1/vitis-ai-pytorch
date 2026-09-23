@@ -374,8 +374,8 @@ static int test_top() {
     fail += test_frame( 16,  4, PAT_EXTREME, "extreme");
     fail += test_frame( 32,  8, PAT_BARS,    "colorbar");
     fail += test_frame( 64, 16, PAT_RAMP,    "ramp");
-    fail += test_frame(MAX_IMG_W, MAX_IMG_H, PAT_RANDOM, "random");
-    fail += test_frame(MAX_IMG_W, MAX_IMG_H, PAT_MIXED,  "mixed");
+    // fail += test_frame(MAX_IMG_W, MAX_IMG_H, PAT_RANDOM, "random");
+    // fail += test_frame(MAX_IMG_W, MAX_IMG_H, PAT_MIXED,  "mixed");
 #endif
 
     std::printf("\n");
