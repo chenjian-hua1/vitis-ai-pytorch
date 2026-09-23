@@ -20,7 +20,7 @@
 //  不可直接寫進 .range()，否則會經過 64-bit 轉換被截斷。
 // =====================================================================
 
-#include "uyvy2rgb.h"
+#include "uyvy2rgb_top.h"
 #include "uyvy2rgb_impl.h"      // cvt_pair
 #include <hls_stream.h>
 #include <ap_int.h>
