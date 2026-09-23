@@ -13,7 +13,20 @@
 
 #include "ap_int.h"
 #include "ap_fixed.h"
-#include "uyvy2rgb.h"          /* dsp_w_t / dsp_x_t / dsp_acc_t / uvy_w_t */
+
+/* ---- DSP48E2 埠型別 ----
+ *   A port 27-bit signed：打包兩個權重 {w_hi, guard, w_lo}
+ *   B port 18-bit signed：色差 D / E（符號延伸到 18 bit）
+ *   P      48-bit：乘加結果，取 [16:0] 與 [33:18] 兩個欄位 */
+typedef ap_int<27>              dsp_w_t;
+typedef ap_int<18>              dsp_x_t;
+typedef ap_int<48>              dsp_acc_t;
+
+/* ---- 權重型別 ----
+ *   Q1.8 無號，取最近值：1.772 -> 454/256，1.402 -> 359/256，
+ *   0.344136 -> 88/256，0.714136 -> 183/256
+ *   w_lo 取 [8:0]，w_hi 取 [7:0] */
+typedef ap_ufixed<9, 1, AP_RND> uvy_w_t;
 
 void subtract_128(ap_uint<8> &in, ap_int<8> &out);
 void mac(dsp_w_t &w, dsp_x_t &x, dsp_acc_t &b, dsp_acc_t &acc);
