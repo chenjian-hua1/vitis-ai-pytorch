@@ -111,18 +111,16 @@ RD: for (ap_uint<32> i = 0; i < in_beats; i++) {
 
 /* ################################################################
  *
- *  第二段：寫出資料選擇 —— 192 -> 128 輸出對齊狀態機 + AXI 寫出
+ *  第二段：寫出資料選擇 —— 192 -> 128 (leftover) + 寫 DDR
  *
- *    每筆輸入 192 bit，每拍輸出 128 bit，暫存長度 L 只有三種：
+ *    殘留量只會是 0 / 64 / 128 三種：
+ *      st=0  res=0   : 讀一筆，輸出 d[127:0]，留 d[191:128]      (64)
+ *      st=1  res=64  : 讀一筆，輸出 {d[63:0], res}，留 d[191:64] (128)
+ *      st=2  res=128 : 不讀，直接輸出 res，清空
  *
- *    狀態  暫存 L  讀入  輸出 w                    暫存 res'          下一狀態
- *    S0      0     是    d[127:0]                  d[191:128] (64)    S1
- *    S1     64     是    {d[63:0], res[63:0]}      d[191:64]  (128)   S2
- *    S2    128     否    res                       —                  S0
- *
- *    週期 3 拍：讀 2 筆（384 bit）、寫 3 筆（384 bit）
- *    要不要讀 = !st[1]（只有 S2 的 st[1]=1），單一 bit
- *    out[i] 是唯一寫入點、位址純遞增 -> burst 推得出來，II=1
+ *    先處理「不讀」的 st=2，stream read 只出現在 else 分支
+ *    -> 每 cycle 最多一次 stream read、剛好一次 m_axi write -> II=1
+ *    out[i] 是唯一的寫入點且位址純遞增，burst 才推得出來
  *
  * ################################################################ */
 
@@ -135,27 +133,26 @@ WR: for (ap_uint<32> i = 0; i < out_beats; i++) {
 #pragma HLS PIPELINE II=1
 #pragma HLS LOOP_TRIPCOUNT min=1 max=MAX_OUT
 
-        ap_uint<192> d = 0;
-        if (!st[1])
-            d = si.read();
+        ap_uint<128> w;
 
-        ap_uint<128> w    = 0;
-        ap_uint<128> nres = res;
-        ap_uint<2>   nst  = 0;
-
-        switch (st) {
-        case 0:  w = d.range(127, 0);
-                 nres = d.range(191, 128);                        nst = 1; break;
-        case 1:  w = (d.range(63, 0), res.range(63, 0));
-                 nres = d.range(191, 64);                         nst = 2; break;
-        case 2:  w = res;                                         nst = 0; break;
-        default:                                                  nst = 0; break;
+        if (st == 2) {                       // 殘留已滿 128，這拍不讀
+            w  = res;
+            st = 0;
+        } else {
+            ap_uint<192> d = si.read();
+            if (st == 0) {
+                w   = d.range(127, 0);
+                res = d.range(191, 128);     // 留 64
+                st  = 1;
+            } else {
+                w.range( 63,  0) = res.range(63, 0);
+                w.range(127, 64) = d.range(63, 0);
+                res = d.range(191, 64);      // 留 128
+                st  = 2;
+            }
         }
 
         out[i] = w;                          // 唯一寫入點
-
-        res = nres;
-        st  = nst;
     }
 }
 
