@@ -10,7 +10,12 @@
 #define UYVY2RGB_TOP_H
 
 #include "ap_int.h"
-#include "uyvy2rgb.h"        /* dsp 型別、MAX_IN / MAX_OUT */
+#include "uyvy2rgb_impl.h"   /* dsp 型別 */
+
+/* co-simulation 用的 m_axi depth（只影響模擬，不影響合成出來的硬體）
+ * 取最大尺寸 4096 x 4096 */
+#define MAX_IN     (4096 * 4096 / 8)          /* 輸入拍數：一拍 8 pixel */
+#define MAX_OUT    (MAX_IN + MAX_IN / 2)      /* 輸出拍數：輸入 x 1.5 */
 
 /*
  * 限制
