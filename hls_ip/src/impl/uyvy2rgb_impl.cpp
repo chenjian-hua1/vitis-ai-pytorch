@@ -132,7 +132,7 @@ void cvt_core(ap_uint<8> &y, ap_int<8> &d, ap_int<8> &e, ap_uint<24> &pixel) {
 void cvt_pair(ap_uint<8> y0, ap_uint<8> y1,
               ap_uint<8> u,  ap_uint<8> v,
               ap_uint<24> &px0, ap_uint<24> &px1) {
-#pragma HLS INLINE off
+#pragma HLS INLINE
     uvy_w_t d_wlo = 1.772, d_whi = 0.344136, e_wlo = 1.402, e_whi = 0.714136;
 
     ap_int<8> d, e;

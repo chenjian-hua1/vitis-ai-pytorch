@@ -146,10 +146,10 @@ void cvt_core(ap_uint<8> &y, ap_int<8> &d, ap_int<8> &e, ap_uint<24> &pixel) {
 //    - 低位為負 <=> D 為負       ->  借位補償變成 C port bit18 = d[7]，一條線
 //    - 高位 acc[33:18] 直接就是 w_hi*D，不需要任何修正
 // =====================================================================
-static void cvt_pair(ap_uint<8> y0, ap_uint<8> y1,
+static inline void cvt_pair(ap_uint<8> y0, ap_uint<8> y1,
                      ap_uint<8> u,  ap_uint<8> v,
                      ap_uint<24> &px0, ap_uint<24> &px1) {
-#pragma HLS INLINE off
+// #pragma HLS INLINE off
     uvy_w_t d_wlo = 1.772, d_whi = 0.344136, e_wlo = 1.402, e_whi = 0.714136;
 
     ap_int<8> d, e;
@@ -239,7 +239,7 @@ PIX: for (int k = 0; k < 2; k++) {
 //  想要 BGR 的話直接回傳 p 不要換位
 // ---------------------------------------------------------------------
 static inline ap_uint<24> to_mem(ap_uint<24> p) {
-#pragma HLS INLINE
+// #pragma HLS INLINE
     ap_uint<24> m;
     m.range( 7,  0) = p.range(23, 16);   // R
     m.range(15,  8) = p.range(15,  8);   // G
@@ -251,7 +251,7 @@ static inline ap_uint<24> to_mem(ap_uint<24> p) {
 //  Stage 1: 讀 DDR + 轉換
 //    每拍讀 128-bit = 4 組 UYVY，4 個 cvt_pair 並行 -> 8 pixel = 192-bit
 // =====================================================================
-static void read_convert(const ap_uint<128> *in,
+static inline void read_convert(const ap_uint<128> *in,
                          hls::stream<ap_uint<192> > &fifo,
                          ap_uint<32> in_beats) {
 RD: for (ap_uint<32> i = 0; i < in_beats; i++) {
@@ -288,7 +288,7 @@ GRP:    for (int gidx = 0; gidx < 4; gidx++) {
 //    每 cycle 最多一次 stream read、剛好一次 m_axi write -> II=1
 //    out[i] 是唯一的寫入點且位址純遞增，burst 才推得出來
 // =====================================================================
-static void repack_write(hls::stream<ap_uint<192> > &si,
+static inline void repack_write(hls::stream<ap_uint<192> > &si,
                          ap_uint<128> *out, ap_uint<32> out_beats) {
     ap_uint<128> res = 0;
     ap_uint<2>   st  = 0;
@@ -299,29 +299,29 @@ WR: for (ap_uint<32> i = 0; i < out_beats; i++) {
 
         ap_uint<128> w;
 
-//        // st[1]=1 只出現在 st==2，所以「要不要讀」是單一 bit，不是比較
-//		ap_uint<192> d = 0;
-//		if (!st[1]) d = si.read();
-//        // switch 的 select 直接就是 st 兩個 bit，合成出來是純 mux
-//        switch (st) {
-//        case 0:                                  // 無殘留: 輸出低 128，留 64
-//            w   = d.range(127,   0);
-//            res = d.range(191, 128);
-//            st  = 1;
-//            break;
-//
-//        case 1:                                  // 殘留 64: 拼成 128，留 128
-//            w.range( 63,  0) = res.range(63, 0);
-//            w.range(127, 64) = d.range( 63, 0);
-//            res = d.range(191, 64);
-//            st  = 2;
-//            break;
-//
-//        default:                                 // 殘留 128: 直接輸出，清空
-//            w   = res;
-//            st  = 0;
-//            break;
-//        }
+    //    // st[1]=1 只出現在 st==2，所以「要不要讀」是單一 bit，不是比較
+	// 	ap_uint<192> d = 0;
+	// 	if (!st[1]) d = si.read();
+    //    // switch 的 select 直接就是 st 兩個 bit，合成出來是純 mux
+    //    switch (st) {
+    //    case 0:                                  // 無殘留: 輸出低 128，留 64
+    //        w   = d.range(127,   0);
+    //        res = d.range(191, 128);
+    //        st  = 1
+    //        break;
+
+    //    case 1:                                  // 殘留 64: 拼成 128，留 128
+    //        w.range( 63,  0) = res.range(63, 0);
+    //        w.range(127, 64) = d.range( 63, 0);
+    //        res = d.range(191, 64);
+    //        st  = 2;
+    //        break;
+
+    //    default:                                 // 殘留 128: 直接輸出，清空
+    //        w   = res;
+    //        st  = 0;
+    //        break;
+    //    }
 
         if (st == 2) {                       // 殘留已滿 128，這拍不讀
 			w  = res;

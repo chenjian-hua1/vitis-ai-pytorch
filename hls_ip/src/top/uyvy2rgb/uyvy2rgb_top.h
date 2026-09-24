@@ -10,7 +10,7 @@
 #define UYVY2RGB_TOP_H
 
 #include "ap_int.h"
-#include "uyvy2rgb_impl.h"   /* dsp 型別 */
+#include "../../impl/uyvy2rgb_impl.h"   /* dsp 型別 */
 
 #define COSIM_MODE
 

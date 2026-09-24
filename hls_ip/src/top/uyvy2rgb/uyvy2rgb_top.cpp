@@ -21,7 +21,7 @@
 // =====================================================================
 
 #include "uyvy2rgb_top.h"
-#include "uyvy2rgb_impl.h"      // cvt_pair
+#include "../../impl/uyvy2rgb_impl.h" // cvt_pair
 #include <hls_stream.h>
 #include <ap_int.h>
 
@@ -39,13 +39,13 @@
  *  計算資料選擇：raw[32g+31 : 32g] = {Y1, V, Y0, U}，g = 0..3
  *  固定切片，無狀態
  * ================================================================ */
-static void uyvy_in_select(const ap_uint<128> &raw,
+static inline void uyvy_in_select(const ap_uint<128> &raw,
                               ap_uint<8> u [UYVY_GRP],
                               ap_uint<8> y0[UYVY_GRP],
                               ap_uint<8> v [UYVY_GRP],
                               ap_uint<8> y1[UYVY_GRP])
 {
-#pragma HLS INLINE
+// #pragma HLS INLINE
     for (int g = 0; g < UYVY_GRP; g++) {
 #pragma HLS UNROLL
         const int s = g * 32;
@@ -63,10 +63,10 @@ static void uyvy_in_select(const ap_uint<128> &raw,
  *    記憶體 byte 順序 R,G,B（byte0 = R），px[k] 放在 [24k+23 : 24k]
  *    想要 BGR 的話 m = px[k] 不要換位即可
  * ================================================================ */
-static ap_uint<192> uyvy_out_select(const ap_uint<24> px[UYVY_PIX])
+static inline void uyvy_out_select(const ap_uint<24> px[UYVY_PIX], ap_uint<192> &out)
 {
-#pragma HLS INLINE
-    ap_uint<192> out = 0;
+// #pragma HLS INLINE
+    out = 0;
     for (int k = 0; k < UYVY_PIX; k++) {
 #pragma HLS UNROLL
         ap_uint<24> m;
@@ -75,10 +75,10 @@ static ap_uint<192> uyvy_out_select(const ap_uint<24> px[UYVY_PIX])
         m.range(23, 16) = px[k].range( 7,  0);   /* B */
         out.range(k * 24 + 23, k * 24) = m;
     }
-    return out;
+    // return out;
 }
 
-static void read_convert(const ap_uint<128>          *in,
+static inline void read_convert(const ap_uint<128>          *in,
                          hls::stream<ap_uint<192> >  &rgb_out,
 						 ap_uint<32> in_beats)
 {
@@ -102,7 +102,10 @@ RD: for (ap_uint<32> i = 0; i < in_beats; i++) {
             cvt_pair(y0[g], y1[g], u[g], v[g], px[2 * g], px[2 * g + 1]);
         }
 
-        rgb_out.write(uyvy_out_select(px));            /* 寫出資料選擇 */
+        ap_uint<192> px_out;
+        uyvy_out_select(px, px_out);
+
+        rgb_out.write(px_out);            /* 寫出資料選擇 */
     }
 }
 
@@ -184,7 +187,7 @@ void uyvy2rgb(ap_uint<128> *uyvy_axi_bus, ap_uint<128> *rgb_axi_bus,
     ap_uint<32> out_beats = in_beats + (in_beats >> 1);      // x1.5
 
     hls::stream<ap_uint<192> > pix_fifo;
-#pragma HLS STREAM        variable=pix_fifo depth=16
+#pragma HLS STREAM        variable=pix_fifo depth=32
 #pragma HLS BIND_STORAGE  variable=pix_fifo type=fifo impl=srl
 
     read_convert (uyvy_axi_bus, pix_fifo, in_beats);
