@@ -467,59 +467,84 @@ static void pack_side(hls::stream<ap_uint<96> >  &result_in,
         ap_uint<128> w;
         bool         emit;
 
+
         if (s3) {
             /* ---- 3 倍：每筆 48 bit ---- */
             ap_uint<48> r3 = res.range(47, 0);
 
-            if (st == 2 || st == 5 || st == 7) {     /* 湊滿 128，寫出 */
+            switch (st) {
+            case 0:                                  /* 0  -> 48  */
+                hold.range( 47,  0) = r3;
+                st = 1;
+                break;
+            case 1:                                  /* 48 -> 96  */
+                hold.range( 95, 48) = r3;
+                st = 2;
+                break;
+            case 2:                                  /* 暫存 96 + 32，寫出，留 16 */
+                w.range( 95,  0) = hold.range(95, 0);
+                w.range(127, 96) = r3.range(31, 0);
+                hold.range(15, 0) = r3.range(47, 32);
                 emit = true;
-                if (st == 2) {                       /* 暫存 96 + 32 */
-                    w.range( 95,  0) = hold.range(95, 0);
-                    w.range(127, 96) = r3.range(31, 0);
-                    hold.range(15, 0) = r3.range(47, 32);    /* 留 16 */
-                    st = 3;
-                } else if (st == 5) {                /* 暫存 112 + 16 */
-                    w.range(111,   0) = hold.range(111, 0);
-                    w.range(127, 112) = r3.range(15, 0);
-                    hold.range(31, 0) = r3.range(47, 16);    /* 留 32 */
-                    st = 6;
-                } else {                             /* 暫存 80 + 48 */
-                    w.range( 79,  0) = hold.range(79, 0);
-                    w.range(127, 80) = r3;                   /* 留 0 */
-                    st = 0;
-                }
-            } else {                                 /* 湊不滿，存進暫存 */
-                emit = false;
-                if      (st == 0) hold.range( 47,  0) = r3;  /* 0  -> 48  */
-                else if (st == 1) hold.range( 95, 48) = r3;  /* 48 -> 96  */
-                else if (st == 3) hold.range( 63, 16) = r3;  /* 16 -> 64  */
-                else if (st == 4) hold.range(111, 64) = r3;  /* 64 -> 112 */
-                else              hold.range( 79, 32) = r3;  /* 32 -> 80  */
-                st = st + 1;
+                st = 3;
+                break;
+            case 3:                                  /* 16 -> 64  */
+                hold.range( 63, 16) = r3;
+                st = 4;
+                break;
+            case 4:                                  /* 64 -> 112 */
+                hold.range(111, 64) = r3;
+                st = 5;
+                break;
+            case 5:                                  /* 暫存 112 + 16，寫出，留 32 */
+                w.range(111,   0) = hold.range(111, 0);
+                w.range(127, 112) = r3.range(15, 0);
+                hold.range(31, 0) = r3.range(47, 16);
+                emit = true;
+                st = 6;
+                break;
+            case 6:                                  /* 32 -> 80  */
+                hold.range( 79, 32) = r3;
+                st = 7;
+                break;
+            case 7:                                  /* 暫存 80 + 48，寫出，留 0 */
+            default:                                 /* st 為 3 bit，0~7 皆合法 */
+                w.range( 79,  0) = hold.range(79, 0);
+                w.range(127, 80) = r3;
+                emit = true;
+                st = 0;
+                break;
             }
         } else {
             /* ---- 2 倍：每筆 96 bit ---- */
-            if (st == 0) {                           /* 暫存 0，湊不滿 */
-                emit = false;
-                hold.range(95, 0) = res;             /* 留 96 */
+            switch (st) {
+            case 0:                                  /* 0 -> 96 */
+                hold.range(95, 0) = res;
                 st = 1;
-            } else {                                 /* 湊滿 128，寫出 */
+                break;
+            case 1:                                  /* 暫存 96 + 32，寫出，留 64 */
+                w.range( 95,  0) = hold.range(95, 0);
+                w.range(127, 96) = res.range(31, 0);
+                hold.range(63, 0) = res.range(95, 32);
                 emit = true;
-                if (st == 1) {                       /* 暫存 96 + 32 */
-                    w.range( 95,  0) = hold.range(95, 0);
-                    w.range(127, 96) = res.range(31, 0);
-                    hold.range(63, 0) = res.range(95, 32);   /* 留 64 */
-                    st = 2;
-                } else if (st == 2) {                /* 暫存 64 + 64 */
-                    w.range( 63,  0) = hold.range(63, 0);
-                    w.range(127, 64) = res.range(63, 0);
-                    hold.range(31, 0) = res.range(95, 64);   /* 留 32 */
-                    st = 3;
-                } else {                             /* 暫存 32 + 96 */
-                    w.range( 31,  0) = hold.range(31, 0);
-                    w.range(127, 32) = res;                  /* 留 0 */
-                    st = 0;
-                }
+                st = 2;
+                break;
+            case 2:                                  /* 暫存 64 + 64，寫出，留 32 */
+                w.range( 63,  0) = hold.range(63, 0);
+                w.range(127, 64) = res.range(63, 0);
+                hold.range(31, 0) = res.range(95, 64);
+                emit = true;
+                st = 3;
+                break;
+            case 3:                                  /* 暫存 32 + 96，寫出，留 0 */
+                w.range( 31,  0) = hold.range(31, 0);
+                w.range(127, 32) = res;
+                emit = true;
+                st = 0;
+                break;
+            default:                                 /* 4~7 不合法，回到 S0 */
+                st = 0;
+                break;
             }
         }
 
