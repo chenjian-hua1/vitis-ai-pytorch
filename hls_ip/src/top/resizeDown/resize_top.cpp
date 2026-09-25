@@ -103,7 +103,7 @@ static void calc_params(ap_uint<12>  img_w,
                         ap_uint<32> &out_words,
                         ap_uint<12> &out_w)
 {
-// #pragma HLS INLINE offㄋ
+// #pragma HLS INLINE off
 #pragma HLS ALLOCATION function instances=mul12 limit=1
     const ap_uint<12> K_DIV3 = 1366;                     /* x/3 = (x*1366)>>12 */
 
