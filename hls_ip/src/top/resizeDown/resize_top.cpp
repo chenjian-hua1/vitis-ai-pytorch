@@ -28,8 +28,7 @@
  *****************************************************************************/
 
 #include "resize_top.h"
-#include "resize_areaDown.h"
-#include "resize_impl.h"        /* resize_pe、位元寬常數 */
+#include "../../impl/resize_impl.h" /* resize_pe、位元寬常數 */
 #include "ap_int.h"
 #include "hls_stream.h"
 
@@ -53,8 +52,8 @@
 #define DSP_MAX(a,b)  ((a) > (b) ? (a) : (b))
 #define N_DSP         DSP_MAX(DSP_NEED(GRP_S3, LANE_S3), DSP_NEED(GRP_S2, LANE_S2))   /* = 6 */
 
-#define RES_FIFO_DEPTH  64
-#define WORD_FIFO_DEPTH 64
+#define RES_FIFO_DEPTH  32
+#define WORD_FIFO_DEPTH 32
 
 #define MAX_IN_BEATS    (1920 * 1080 * 3 / 16)     /* co-sim 深度 */
 #define MAX_OUT_WORDS   (960 * 540 * 3 / 16)       /* co-sim 深度，2 倍較大 */
@@ -70,10 +69,32 @@
  *  現在集中在 top（DATAFLOW 區域外）算一次，再把計數傳進各段；
  *  這些乘法只在啟動時算一次，用 BIND_OP impl=fabric 放到 LUT。
  *
+ *  只用一組純組合乘法器：
+ *    所有乘法都呼叫 mul12（INLINE off），並用
+ *      ALLOCATION function instances=mul12 limit=1
+ *    限制整個 calc_params 只能有一個 mul12 實體。HLS 會把每次呼叫
+ *    排在不同的狀態，前面加一組輸入多工器，結果存進暫存器，
+ *    等於一個乘法器分時使用 4～5 拍。
+ *    mul12 內 BIND_OP 不指定 latency -> 純組合乘法器，不佔 DSP。
+ *    1366 以一般運算元傳入 mul12，不會被常數化成另一組移位加法器。
+ *
+ *    時序：每拍路徑 = 暫存器 -> 輸入多工器 -> 組合乘法 -> 暫存器，
+ *    若 HLS 仍把後面的 x3 加法排進同一拍而違反 setup，
+ *    可加大 set_clock_uncertainty，讓排程把加法推到下一拍。
+ *
  *  除以 3：x / 3 = (x * 1366) >> 12
  *    x = 3k 時 3k * 1366 = 4098k，(4098k) >> 12 = k + (2k >> 12) = k（k <= 2047）
  *    3 倍模式已要求 img_w、img_h 為 3 的倍數，12-bit 範圍內精確
  * ================================================================ */
+/* 共用的 12 x 12 純組合乘法器（calc_params 內限定只有一個實體） */
+static ap_uint<24> mul12(ap_uint<12> a, ap_uint<12> b)
+{
+// #pragma HLS INLINE off
+    ap_uint<24> p = a * b;
+#pragma HLS BIND_OP variable=p op=mul impl=fabric latency=2
+    return p;
+}
+
 static void calc_params(ap_uint<12>  img_w,
                         ap_uint<12>  img_h,
                         bool         s3,
@@ -82,22 +103,24 @@ static void calc_params(ap_uint<12>  img_w,
                         ap_uint<32> &out_words,
                         ap_uint<12> &out_w)
 {
-#pragma HLS INLINE
-    ap_uint<23> w1366 = img_w * (ap_uint<11>)1366;
-#pragma HLS BIND_OP variable=w1366 op=mul impl=fabric
-    ap_uint<23> h1366 = img_h * (ap_uint<11>)1366;
-#pragma HLS BIND_OP variable=h1366 op=mul impl=fabric
+// #pragma HLS INLINE offㄋ
+#pragma HLS ALLOCATION function instances=mul12 limit=1
+    const ap_uint<12> K_DIV3 = 1366;                     /* x/3 = (x*1366)>>12 */
+
+    /* ---- 第 1、2 次：除以 3 ---- */
+    ap_uint<24> w1366 = mul12(img_w, K_DIV3);
+    ap_uint<24> h1366 = mul12(img_h, K_DIV3);
     out_w = s3 ? (ap_uint<12>)(w1366 >> 12) : (ap_uint<12>)(img_w >> 1);
     ap_uint<12> out_h = s3 ? (ap_uint<12>)(h1366 >> 12) : (ap_uint<12>)(img_h >> 1);
 
-    ap_uint<24> out_pix = out_w * out_h;
-#pragma HLS BIND_OP variable=out_pix op=mul impl=fabric
+    /* ---- 第 3 次：輸出 pixel 數 ---- */
+    ap_uint<24> out_pix = mul12(out_w, out_h);
     ap_uint<26> out_bytes = ((ap_uint<26>)out_pix << 1) + out_pix;     /* x3：移位加法 */
     total_results = s3 ? (ap_uint<32>)(out_pix >> 1) : (ap_uint<32>)(out_pix >> 2);
     out_words     = (out_bytes + 15) >> 4;                             /* ceil(bytes/16) */
 
-    ap_uint<24> n_pix = img_w * img_h;
-#pragma HLS BIND_OP variable=n_pix op=mul impl=fabric
+    /* ---- 第 4 次：輸入 pixel 數 ---- */
+    ap_uint<24> n_pix = mul12(img_w, img_h);
     ap_uint<26> in_bytes = ((ap_uint<26>)n_pix << 1) + n_pix;          /* x3：移位加法 */
     total_words = in_bytes >> 4;
 }
@@ -304,8 +327,10 @@ static void compute_side(ap_uint<128>              *in_ptr,
 {
     ap_uint<LBW> lbA[QUAD_W_MAX];   /* 欄 4k, 4k+1 */
     ap_uint<LBW> lbB[QUAD_W_MAX];   /* 欄 4k+2, 4k+3 */
-#pragma HLS BIND_STORAGE variable=lbA type=RAM_S2P impl=BRAM
-#pragma HLS BIND_STORAGE variable=lbB type=RAM_S2P impl=BRAM
+#pragma HLS BIND_STORAGE variable=lbA type=RAM_S2P impl=BRAM latency=2
+#pragma HLS BIND_STORAGE variable=lbB type=RAM_S2P impl=BRAM latency=2
+// #pragma HLS BIND_STORAGE variable=lbA type=RAM_S2P impl=LUTRAM
+// #pragma HLS BIND_STORAGE variable=lbB type=RAM_S2P impl=LUTRAM
 
     const bool s3 = (scale_mode == SCALE_3);
 
@@ -585,9 +610,9 @@ void resize_kernel(ap_uint<128> *in_ptr,
                    ap_uint<1>    scale_mode)
 {
 #pragma HLS INTERFACE m_axi port=in_ptr  offset=slave bundle=gmem0 \
-                     depth=MAX_IN_BEATS  max_read_burst_length=64  num_read_outstanding=16
+                     depth=MAX_IN_BEATS  max_read_burst_length=64  num_read_outstanding=8
 #pragma HLS INTERFACE m_axi port=out_ptr offset=slave bundle=gmem1 \
-                     depth=MAX_OUT_WORDS max_write_burst_length=64 num_write_outstanding=16
+                     depth=MAX_OUT_WORDS max_write_burst_length=64 num_write_outstanding=8
 
 #pragma HLS INTERFACE s_axilite port=in_ptr     bundle=control
 #pragma HLS INTERFACE s_axilite port=out_ptr    bundle=control

@@ -21,7 +21,7 @@ ap_uint<PROD_W> dsp_addmul(ap_uint<OPW> a, ap_uint<OPW> d, ap_uint<SRW> b)
 #pragma HLS INLINE
     ap_uint<OPW>    pre = a + d;       /* 前加器 */
     ap_uint<PROD_W> m   = pre * b;     /* 乘法器 */
-#pragma HLS BIND_OP variable=m op=mul impl=dsp
+#pragma HLS BIND_OP variable=m op=mul impl=dsp latency=3
     return m;
 }
 
