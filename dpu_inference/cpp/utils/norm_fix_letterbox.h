@@ -1,13 +1,15 @@
-// norm_letterbox_lut.hpp
-// Letterbox 影像的 norm_and_fix，NEON 查表版
+// norm_fix_letterbox.h
+// Letterbox 影像的 norm_and_fix（AArch64 用 NEON 查表，其他平台用一般計算）
 //
 // 呼叫端只需要：
 //   norm_and_fix_letterbox(img, fix_point, y0, y1, out);
 //
-// 其餘全部在 norm_letterbox_lut.cpp 內處理：
-//   - 查表：fix_point 改變時自動重建（結果與原本 float 版逐位元一致）
+// 其餘全部在 norm_fix_letterbox.cpp 內處理：
+//   - 參數：fix_point 改變時自動重建查表／係數（結果與原本 float 版逐位元一致）
 //   - 黑邊：同一個 out buffer、同樣的 y0/y1/fix_point/尺寸 → 只在第一次填入
-//   - 只計算影像內容列 [y0, y1)，NEON TBL/TBX 一次處理 16 pixel
+//   - 只計算影像內容列 [y0, y1)
+//       AArch64（含 KV260）：NEON TBL/TBX 查表，一次處理 16 pixel
+//       其他平台          ：一般 float 計算（原本 norm_and_fix 的公式）
 //
 // 注意：
 //   - out 請每幀重複使用同一個 cv::Mat；最多同時記住 4 個 out buffer（例如 double buffering）。
