@@ -9,6 +9,8 @@
 // 注意：NEON 查表用到的 vqtbl4q / vqtbx4q 只存在於 AArch64；
 //       32-bit ARM（ARMv7）即使有 NEON 也沒有這兩個指令，因此會走一般計算。
 
+#include "norm_fix_letterbox.h"
+
 #include <algorithm>
 #include <climits>
 #include <cmath>
