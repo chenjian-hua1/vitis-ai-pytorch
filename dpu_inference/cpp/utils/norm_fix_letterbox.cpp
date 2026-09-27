@@ -9,14 +9,12 @@
 // 注意：NEON 查表用到的 vqtbl4q / vqtbx4q 只存在於 AArch64；
 //       32-bit ARM（ARMv7）即使有 NEON 也沒有這兩個指令，因此會走一般計算。
 
-#include "norm_fix_letterbox.h"
-
 #include <algorithm>
 #include <climits>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-
+ 
 // ---------------------------------------------------------------------------
 // 編譯期路徑選擇
 // ---------------------------------------------------------------------------
@@ -27,31 +25,31 @@
 #else
 #define LBN_USE_NEON_LUT 0
 #endif
-
+ 
 #if defined(__GNUC__)
 #define LBN_RESTRICT __restrict__
 #else
 #define LBN_RESTRICT
 #endif
-
+ 
 namespace {
-
+ 
 // ---- 正規化參數：與原本 .cpp 的定義逐字相同 ----
 constexpr float kMeanR = 0.485f, kMeanG = 0.456f, kMeanB = 0.406f;
 constexpr float kStdR  = 0.229f, kStdG  = 0.224f, kStdB  = 0.225f;
-
+ 
 constexpr float kU8ScaleR = 1.f/(kStdR*255.f);
 constexpr float kU8ScaleG = 1.f/(kStdG*255.f);
 constexpr float kU8ScaleB = 1.f/(kStdB*255.f);
 constexpr float kU8BiasR  = -kMeanR/kStdR;
 constexpr float kU8BiasG  = -kMeanG/kStdG;
 constexpr float kU8BiasB  = -kMeanB/kStdB;
-
+ 
 #if LBN_USE_NEON_LUT
 // ===========================================================================
 //  AArch64：NEON 查表
 // ===========================================================================
-
+ 
 // ===== BEGIN LUT BUILD =====
 // 建立查表：與原本 norm_and_fix 相同的公式與運算順序
 //   scale = kU8Scale * 2^fix_point、bias = kU8Bias * 2^fix_point
@@ -75,11 +73,11 @@ void build_lut(int fix_point, int8_t lut[768])
         }
 }
 // ===== END LUT BUILD =====
-
+ 
 // ===== BEGIN KERNEL =====
 // lut：三張表連續排放，[0..255]=R, [256..511]=G, [512..767]=B
 // src/dst：交錯的 RGB，共 total 個 pixel
-
+ 
 // 256 項的表拆成 4 段，每段 64 bytes 剛好是一次 vqtbl4q / vqtbx4q 的容量。
 // TBL：索引超出 0..63 → 輸出 0；TBX：索引超出範圍 → 保留原值。
 // 每查完一段就把索引減 64，四段串起來即涵蓋 0..255。
@@ -92,7 +90,7 @@ inline uint8x16_t lookup256(const uint8_t* LBN_RESTRICT t, uint8x16_t idx)
     idx = vsubq_u8(idx, c64); r = vqtbx4q_u8(r, vld1q_u8_x4(t + 192), idx);
     return r;
 }
-
+ 
 void lut_kernel(const uint8_t* LBN_RESTRICT src,
                 int8_t*        LBN_RESTRICT dst,
                 std::ptrdiff_t total,
@@ -104,7 +102,7 @@ void lut_kernel(const uint8_t* LBN_RESTRICT src,
     const uint8_t* tG = tR + 256;
     const uint8_t* tB = tR + 512;
     uint8_t* d = reinterpret_cast<uint8_t*>(dst);
-
+ 
     std::ptrdiff_t i = 0;
     for (; i + 16 <= total; i += 16) {
         uint8x16x3_t p = vld3q_u8(src + 3*i);   // 反交錯成 R/G/B 三個平面
@@ -120,12 +118,12 @@ void lut_kernel(const uint8_t* LBN_RESTRICT src,
     }
 }
 // ===== END KERNEL =====
-
+ 
 #else
 // ===========================================================================
 //  其他平台：一般計算（原本 norm_and_fix 的公式，逐字相同）
 // ===========================================================================
-
+ 
 // ===== BEGIN GENERIC KERNEL =====
 // scale/bias 已乘上 2^fix_point
 void float_kernel(const uint8_t* LBN_RESTRICT src,
@@ -135,7 +133,7 @@ void float_kernel(const uint8_t* LBN_RESTRICT src,
 {
     const float scaleR = scale[0], scaleG = scale[1], scaleB = scale[2];
     const float biasR  = bias[0],  biasG  = bias[1],  biasB  = bias[2];
-
+ 
     #pragma omp simd
     for (std::ptrdiff_t i = 0; i < total; ++i) {
         dst[3*i + 0] = static_cast<int8_t>(std::clamp(src[3*i + 0] * scaleR + biasR, -128.f, 127.f));
@@ -144,13 +142,13 @@ void float_kernel(const uint8_t* LBN_RESTRICT src,
     }
 }
 // ===== END GENERIC KERNEL =====
-
+ 
 #endif
-
+ 
 // ---------------------------------------------------------------------------
 //  快取
 // ---------------------------------------------------------------------------
-
+ 
 // 記錄某個 out buffer 的黑邊是以什麼參數填的。
 // held 持有該 buffer 的一份參照（引用計數 +1），確保它不會被釋放；
 // 因此只要 out.data 與 held.data 相同，就一定是同一塊記憶體，
@@ -159,9 +157,9 @@ struct PadRecord {
     cv::Mat held;
     int y0 = -1, y1 = -1, fix_point = INT_MIN;
 };
-
+ 
 constexpr int kMaxBuffers = 4;
-
+ 
 struct Cache {
     int fix_point = INT_MIN;             // 目前參數對應的 fix_point；INT_MIN → 尚未準備
 #if LBN_USE_NEON_LUT
@@ -173,13 +171,13 @@ struct Cache {
     PadRecord pads[kMaxBuffers];
     int       next = 0;                  // 滿了之後輪流覆蓋
 };
-
+ 
 Cache& cache()
 {
     thread_local Cache c;
     return c;
 }
-
+ 
 // fix_point 改變時，準備該路徑需要的參數與黑邊值
 void prepare(Cache& c, int fix_point)
 {
@@ -199,43 +197,43 @@ void prepare(Cache& c, int fix_point)
 #endif
     c.fix_point = fix_point;
 }
-
+ 
 } // namespace
-
+ 
 void norm_letterbox_reset()
 {
     cache() = Cache{};
 }
-
+ 
 void norm_and_fix_letterbox(const cv::Mat& x, int fix_point, int y0, int y1, cv::Mat& out)
 {
     CV_Assert(x.type() == CV_8UC3 && x.isContinuous());
     CV_Assert(0 <= y0 && y0 <= y1 && y1 <= x.rows);
-
+ 
     Cache& c = cache();
-
+ 
     // 1) 參數：只跟 fix_point 有關，改變時才重新準備
     if (c.fix_point != fix_point)
         prepare(c, fix_point);
-
+ 
     // 2) 輸出 buffer：尺寸或型別不符才重新配置
     if (out.rows != x.rows || out.cols != x.cols || out.type() != CV_8SC3 || !out.isContinuous())
         out.create(x.rows, x.cols, CV_8SC3);
-
+ 
     // 3) 黑邊：找這個 out buffer 的紀錄，參數都相同才跳過
     PadRecord* rec = nullptr;
-    for (auto& r : c.pads)
+    for (PadRecord& r : c.pads)
         if (!r.held.empty() && r.held.data == out.data) { rec = &r; break; }
-
+ 
     const bool need_fill = !rec
         || rec->y0 != y0 || rec->y1 != y1 || rec->fix_point != fix_point
         || rec->held.rows != out.rows || rec->held.cols != out.cols;
-
+ 
     if (need_fill) {
         const cv::Scalar v(c.pad[0], c.pad[1], c.pad[2]);
         if (y0 > 0)         out.rowRange(0, y0).setTo(v);
         if (y1 < out.rows)  out.rowRange(y1, out.rows).setTo(v);
-
+ 
         if (!rec) {                                              // 新的 buffer → 佔一個位置
             rec = &c.pads[c.next];
             c.next = (c.next + 1) % kMaxBuffers;
@@ -245,7 +243,7 @@ void norm_and_fix_letterbox(const cv::Mat& x, int fix_point, int y0, int y1, cv:
         rec->y1        = y1;
         rec->fix_point = fix_point;
     }
-
+ 
     // 4) 只計算影像內容區域（整列切出的 rowRange 仍是連續記憶體）
     const std::ptrdiff_t total = std::ptrdiff_t(y1 - y0) * x.cols;
     if (total > 0) {
@@ -256,3 +254,4 @@ void norm_and_fix_letterbox(const cv::Mat& x, int fix_point, int y0, int y1, cv:
 #endif
     }
 }
+ 
