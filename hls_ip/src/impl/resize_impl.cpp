@@ -5,24 +5,33 @@
  *****************************************************************************/
 
 #include "resize_impl.h"
+#include <hls_dsp_builtins.h>
 
 /* ================================================================
- *  DSP 計算：P = (A + D) * B
+ *  DSP 計算：P = (A + D) * B，用 DSP builtin 明確指定內部暫存器
  *
- *  對應 DSP48E2：前加器 (A + D) + 乘法器 (* B)
- *  INLINE 後每個呼叫點各自展開成一顆 DSP
+ *  A/D -[AREG/DREG]-> 前加器 -[ADREG]-> 乘法器 -[MREG]-> -[PREG]-> P
+ *  四級全開：前加器與乘法器之間一定有 ADREG，不再依賴 HLS 推論
  *
- *  位元寬：A、D 24 bit unsigned（轉 signed 25 bit <= 27）
- *          B    16 bit unsigned（轉 signed 17 bit <= 18）
- *  lane 不溢位由呼叫端的值域保證（見 dsp_shared 註解）
+ *  位元寬：A、D 24 bit unsigned -> 27 bit signed（恆為正）
+ *          B    16 bit unsigned -> 18 bit signed（恆為正）
+ *          P    48 bit，實際只用低 PROD_W bit
  * ================================================================ */
 ap_uint<PROD_W> dsp_addmul(ap_uint<OPW> a, ap_uint<OPW> d, ap_uint<SRW> b)
 {
 #pragma HLS INLINE
-    ap_uint<OPW>    pre = a + d;       /* 前加器 */
-    ap_uint<PROD_W> m   = pre * b;     /* 乘法器 */
-#pragma HLS BIND_OP variable=m op=mul impl=dsp latency=3
-    return m;
+    using namespace hls::dsp48e2;              /* <- 依 header 確認 */
+
+    ap_int<27> A = a;                          /* 零延伸，值域為正 */
+    ap_int<27> D = d;
+    ap_int<18> B = b;
+    ap_int<48> C = 0;                          /* 不用後加器 */
+
+    /* (A + D) * B + C，四級流水線：輸入、AD、M、P */
+    ap_int<48> P = add_mul_add<REG_A1 | REG_D | REG_AD |
+                               REG_B1 | REG_M | REG_P>(A, D, B, C);  /* <- 依 header 確認 */
+
+    return (ap_uint<PROD_W>)P.range(PROD_W - 1, 0);
 }
 
 
@@ -95,6 +104,9 @@ void resize_pe(ap_uint<8>       u0,
     ap_uint<ACCW> lb_hi = lbp.range(OPW  - 1, ACCW);
     ap_uint<ACCW> lb_lo = lbp.range(ACCW - 1, 0);
 
+    // mux select 
+    // scale 3 : a=u0(pix0)+u1(pix1) d_lo=u2+v(lb)
+    // scale 2 : a=u0(pix0)+u1(pix1) d_lo=u2+v(pix3)  
     ap_uint<ACCW> a_lo  = s3 ? h0 : h1;
     ap_uint<ACCW> d_lo  = s3 ? h1 : lb_lo;
 
