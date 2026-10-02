@@ -17,7 +17,10 @@
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <vector>
+
+#include <unistd.h>      // access()
 
 namespace hls {
 namespace uyvy_resize {
@@ -41,6 +44,12 @@ constexpr size_t      kCtrlSpan = 0x10000;
 // uio_pdrv_genirq 用的是裝置樹「節點名去掉 @位址」,不是 label:
 //   uyvy_resize_0: uyvy_resize@a0010000 { ... }   → UIO 名稱是 "uyvy_resize"
 constexpr const char* kUioName  = "uyvy_resize";
+
+// UIO 找不到時,自動改用 /dev/mem 存取 kCtrlPhys(需要 root、改用輪詢、沒有中斷)。
+// 尋找順序固定是:UIO 名稱 → UIO 位址 → /dev/mem,所以 UIO 設好之後會自動優先用 UIO。
+// 安全檢查:只有在 /proc/device-tree 裡找得到這顆 IP 的節點(代表 overlay /
+// bitstream 已載入)時才會啟用 —— 對沒有 IP 的 PL 位址做存取會讓整塊板子卡死。
+constexpr bool kDevmemFallback = true;
 
 // 參數暫存器(xuyvy_resize_hw.h);0x00–0x0C 是共用的 hls::detail::ap_ctrl
 namespace reg {
@@ -85,8 +94,28 @@ public:
 // ============================================================
 //  3. 裝置單例
 // ============================================================
+// overlay 裡有沒有這顆 IP 的節點(例如 /proc/device-tree/axi/uyvy_resize@a0000000)
+bool overlay_has_node() {
+    char node[64];
+    std::snprintf(node, sizeof node, "%s@%llx", kUioName,
+                  static_cast<unsigned long long>(kCtrlPhys));
+    for (const char* bus : {"/proc/device-tree/axi/", "/proc/device-tree/amba/",
+                            "/proc/device-tree/amba_pl/", "/proc/device-tree/"}) {
+        if (::access((std::string(bus) + node).c_str(), F_OK) == 0) return true;
+    }
+    return false;
+}
+
 IpHolder<Kernel>& device() {
     static IpHolder<Kernel> d(kUioName, kCtrlPhys);
+    // 只在第一次呼叫時決定要不要允許 /dev/mem 後路。
+    // 之後呼叫 use_devmem() / set_ctrl_phys() 仍可覆寫。
+    static const bool init = [] {
+        if (kDevmemFallback && kCtrlPhys != 0 && overlay_has_node())
+            d.set_ctrl_phys(kCtrlPhys, true);
+        return true;
+    }();
+    (void)init;
     return d;
 }
 
@@ -233,12 +262,24 @@ std::string last_error() {
 
 // ============================================================
 //  4-3. downscale —— 只用 IP
+//  in_phys == 0:輸入經 stage_input(已在 pool 內就 zero-copy,否則複製進去)
+//  in_phys != 0:輸入由呼叫端保證在實體連續、已 clean 的記憶體,直接用
 // ============================================================
-bool downscale(const cv::Mat& uyvy, int scale, cv::Mat& rgb,
-               Timing* timing, int timeout_ms) {
+namespace {
+bool downscale_impl(const cv::Mat& uyvy, int scale, cv::Mat& rgb,
+                    Timing* timing, int timeout_ms, uint64_t in_phys) {
     Params p;
     const char* why = "";
-    if (!check_input(uyvy, scale, p, why)) return false;
+    if (!check_input(uyvy, scale, p, why)) {
+        std::lock_guard<std::mutex> lk(device().mutex());
+        run_error() = why;
+        return false;
+    }
+    if (in_phys && !uyvy.isContinuous()) {
+        std::lock_guard<std::mutex> lk(device().mutex());
+        run_error() = "downscale_phys:輸入必須是連續的 Mat";
+        return false;
+    }
 
     auto& d = device();
     std::lock_guard<std::mutex> lk(d.mutex());
@@ -259,7 +300,12 @@ bool downscale(const cv::Mat& uyvy, int scale, cv::Mat& rgb,
     const Stopwatch total;
 
     DmaInput in;
-    if (!stage_input(pool, d.cache(), uyvy, in)) {
+    if (in_phys) {
+        in.phys      = in_phys;
+        in.data      = uyvy.data;
+        in.bytes     = p.in_bytes;
+        in.zero_copy = true;              // copy_ms / sync_ms 皆為 0,clean 由呼叫端做
+    } else if (!stage_input(pool, d.cache(), uyvy, in)) {
         run_error() = "DMA pool 配置輸入 buffer 失敗(空間不足?)";
         return false;
     }
@@ -287,6 +333,18 @@ bool downscale(const cv::Mat& uyvy, int scale, cv::Mat& rgb,
         timing->zero_copy = in.zero_copy;
     }
     return true;
+}
+}  // namespace
+
+bool downscale(const cv::Mat& uyvy, int scale, cv::Mat& rgb,
+               Timing* timing, int timeout_ms) {
+    return downscale_impl(uyvy, scale, rgb, timing, timeout_ms, 0);
+}
+
+bool downscale_phys(const cv::Mat& uyvy, uint64_t in_phys, int scale, cv::Mat& rgb,
+                    Timing* timing, int timeout_ms) {
+    if (!in_phys) return false;
+    return downscale_impl(uyvy, scale, rgb, timing, timeout_ms, in_phys);
 }
 
 
@@ -391,7 +449,7 @@ Plan plan_for(uint32_t in_w, uint32_t in_h, uint32_t need_w, uint32_t need_h) {
 }
 
 void letterbox(const cv::Mat& uyvy, int input_size, LetterboxResult& res,
-               bool allow_ip) {
+               bool allow_ip, uint64_t in_phys) {
     CV_Assert(!uyvy.empty() && uyvy.type() == CV_8UC2 && input_size > 0);
 
     const int orig_h = uyvy.rows, orig_w = uyvy.cols;
@@ -443,7 +501,9 @@ void letterbox(const cv::Mat& uyvy, int input_size, LetterboxResult& res,
     if (plan.use_ip && allow_ip) {
         cv::Mat mid;                          // 指向 IP 的 DMA 輸出,下次呼叫會被蓋
         const Stopwatch sw;
-        const bool ok = downscale(uyvy, static_cast<int>(plan.scale), mid, &res.timing);
+        const bool ok = in_phys
+            ? downscale_phys(uyvy, in_phys, static_cast<int>(plan.scale), mid, &res.timing)
+            : downscale(uyvy, static_cast<int>(plan.scale), mid, &res.timing);
         res.ip_ms = sw.ms();
         if (ok) {
             res.used_ip   = true;
@@ -477,9 +537,10 @@ void letterbox(const cv::Mat& uyvy, int input_size, LetterboxResult& res,
     res.timing.total_ms = res.timing.post_ms;
 }
 
-LetterboxResult letterbox(const cv::Mat& uyvy, int input_size, bool allow_ip) {
+LetterboxResult letterbox(const cv::Mat& uyvy, int input_size, bool allow_ip,
+                          uint64_t in_phys) {
     LetterboxResult res;
-    letterbox(uyvy, input_size, res, allow_ip);
+    letterbox(uyvy, input_size, res, allow_ip, in_phys);
     return res;
 }
 

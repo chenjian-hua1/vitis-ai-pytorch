@@ -1,8 +1,11 @@
 // modelrunner_pipe.cpp
-//
-// DPU output 的 cache 屬性:與原本的 modelrunner.cpp 一致,
-// 0 = 接 HP / non-coherent HPC,需要手動 sync + memcpy 到 cacheable 暫存區。
-#define DPU_OUTPUT_CACHEABLE 0
+
+#ifndef DPU_SYNC_CACHE
+#define DPU_SYNC_CACHE 1
+#endif
+#ifndef DPU_OUTPUT_STAGING
+#define DPU_OUTPUT_STAGING 1
+#endif
 
 #include "modelrunner_pipe.h"
 
@@ -25,6 +28,34 @@ inline float get_input_scale(const xir::Tensor* t) {
 }
 inline float get_output_scale(const xir::Tensor* t) {
     return std::exp2f(-static_cast<float>(t->get_attr<int>("fix_point")));
+}
+
+// NHWC -> NCHW 分塊轉置(N=1)。cvt 決定每個元素怎麼寫入(複製或反量化)。
+template <typename T, typename Cvt>
+inline void transpose_blocked(const int8_t* __restrict__ src, T* __restrict__ dst,
+                              int C, int HW, Cvt cvt)
+{
+    constexpr int BLOCK = 64;
+    for (int c0 = 0; c0 < C; c0 += BLOCK) {
+        const int c_end = std::min(c0 + BLOCK, C);
+        for (int hw0 = 0; hw0 < HW; hw0 += BLOCK) {
+            const int hw_end  = std::min(hw0 + BLOCK, HW);
+            const int hw_end4 = hw0 + ((hw_end - hw0) / 4) * 4;
+            for (int cc = c0; cc < c_end; ++cc) {
+                T* __restrict__ dst_row = dst + static_cast<size_t>(cc) * HW;
+                const int8_t* __restrict__ src_c = src + cc;   // NHWC stride = C
+                int hw = hw0;
+                for (; hw < hw_end4; hw += 4) {
+                    dst_row[hw + 0] = cvt(src_c[(hw + 0) * C]);
+                    dst_row[hw + 1] = cvt(src_c[(hw + 1) * C]);
+                    dst_row[hw + 2] = cvt(src_c[(hw + 2) * C]);
+                    dst_row[hw + 3] = cvt(src_c[(hw + 3) * C]);
+                }
+                for (; hw < hw_end; ++hw)
+                    dst_row[hw] = cvt(src_c[hw * C]);
+            }
+        }
+    }
 }
 
 }  // namespace
@@ -50,10 +81,6 @@ XmodelPipelineEngine::XmodelPipelineEngine(const std::string& xmodel_path, int n
 
     attrs_ = xir::Attrs::create();
 
-    // 每個 context 各建一個 runner。同一個 subgraph 可以建多個,
-    // 各自擁有獨立的輸入/輸出張量緩衝 —— 這正是能夠重疊的關鍵。
-    // 硬體只有一顆 DPU 核心時,執行仍會排隊,但 CPU 端的準備工作
-    // 可以和硬體執行重疊。
     ctxs_.resize(static_cast<size_t>(n_ctx));
     for (int i = 0; i < n_ctx; ++i)
         build_ctx(dpu_sg, ctxs_[static_cast<size_t>(i)], i == 0);
@@ -91,6 +118,7 @@ void XmodelPipelineEngine::build_ctx(const xir::Subgraph* sg, Ctx& c, bool first
     c.outputs.reserve(n);
     c.outputs_nchw.reserve(n);
     c.cache_buf.reserve(n);
+    c.nchw_ready.assign(n, 0);
 
     for (size_t i = 0; i < n; ++i) {
         const auto* t = c.out_tb[i]->get_tensor();
@@ -107,7 +135,7 @@ void XmodelPipelineEngine::build_ctx(const xir::Subgraph* sg, Ctx& c, bool first
         c.outputs.emplace_back(static_cast<int>(sizes.size()), sizes.data(),
                                CV_8S, reinterpret_cast<void*>(addr));
 
-#if DPU_OUTPUT_CACHEABLE == 0
+#if DPU_OUTPUT_STAGING
         c.cache_buf.emplace_back(t->get_data_size());
 #else
         c.cache_buf.emplace_back();
@@ -122,12 +150,12 @@ void XmodelPipelineEngine::build_ctx(const xir::Subgraph* sg, Ctx& c, bool first
 }
 
 
-// ── 交給硬體,立即返回 ────────────────────────────────────────────
 void XmodelPipelineEngine::submit(int ctx)
 {
     Ctx& c = ctxs_.at(static_cast<size_t>(ctx));
+    std::fill(c.nchw_ready.begin(), c.nchw_ready.end(), 0);
 
-#if DPU_OUTPUT_CACHEABLE == 0
+#if DPU_SYNC_CACHE
     for (auto* in : c.in_tb)
         in->sync_for_write(0, in->get_tensor()->get_data_size());
 #endif
@@ -136,7 +164,6 @@ void XmodelPipelineEngine::submit(int ctx)
 }
 
 
-// ── DPU 的時間軸:等硬體完成 ──────────────────────────────────────
 void XmodelPipelineEngine::wait_hw(int ctx)
 {
     Ctx& c = ctxs_.at(static_cast<size_t>(ctx));
@@ -144,65 +171,69 @@ void XmodelPipelineEngine::wait_hw(int ctx)
     const int status = c.runner->wait(static_cast<int>(c.job.first), -1);
     (void)status;
 
-#if DPU_OUTPUT_CACHEABLE == 0
+#if DPU_SYNC_CACHE
     for (auto* out : c.out_tb)
         out->sync_for_read(0, out->get_tensor()->get_data_size());
 #endif
 }
 
 
-// ── CPU 的時間軸:搬移 + 轉置 ─────────────────────────────────────
+// ── 只做 memcpy(STAGING=0 時什麼都不做)───────────────────────────
 void XmodelPipelineEngine::finish(int ctx)
 {
     Ctx& c = ctxs_.at(static_cast<size_t>(ctx));
 
-#if DPU_OUTPUT_CACHEABLE == 0
-    // 先一次性 memcpy 到 cacheable 暫存區:memcpy 是順序存取,
-    // libc 用 NEON 跑滿頻寬,複製完資料留在 cache,後續轉置幾乎全命中。
+#if DPU_OUTPUT_STAGING
     for (size_t i = 0; i < c.out_tb.size(); ++i)
         std::memcpy(c.cache_buf[i].data(), c.outputs[i].ptr<int8_t>(),
                     c.out_tb[i]->get_tensor()->get_data_size());
 #endif
 
-    // NHWC -> NCHW int8 轉置(blocked + unroll x4,N=1)
-    for (size_t i = 0; i < c.out_tb.size(); ++i) {
-        const cv::Mat& nchw = c.outputs_nchw[i];
-        const int C  = nchw.size[1];
-        const int H  = nchw.size[2];
-        const int W  = nchw.size[3];
-        const int HW = H * W;
+    std::fill(c.nchw_ready.begin(), c.nchw_ready.end(), 0);
+}
 
-#if DPU_OUTPUT_CACHEABLE == 0
-        const int8_t* __restrict__ src =
-            reinterpret_cast<const int8_t*>(c.cache_buf[i].data());
+
+const int8_t* XmodelPipelineEngine::nhwc_src(const Ctx& c, size_t i) const
+{
+#if DPU_OUTPUT_STAGING
+    return c.cache_buf[i].data();
 #else
-        const int8_t* __restrict__ src = c.outputs[i].ptr<int8_t>();
+    return c.outputs[i].ptr<int8_t>();
 #endif
-        int8_t* __restrict__ dst = c.outputs_nchw[i].ptr<int8_t>();
+}
 
-        constexpr int BLOCK = 64;
 
-        for (int c0 = 0; c0 < C; c0 += BLOCK) {
-            for (int hw0 = 0; hw0 < HW; hw0 += BLOCK) {
-                const int c_end  = std::min(c0 + BLOCK, C);
-                const int hw_end = std::min(hw0 + BLOCK, HW);
+// ── 轉置 + 反量化,一次走完 ──────────────────────────────────────
+void XmodelPipelineEngine::output_float_nchw(int ctx, size_t idx, cv::Mat& dst)
+{
+    Ctx& c = ctxs_.at(static_cast<size_t>(ctx));
+    if (idx >= c.outputs_nchw.size())
+        throw std::out_of_range("XmodelPipelineEngine::output_float_nchw: idx 超出範圍");
 
-                for (int cc = c0; cc < c_end; ++cc) {
-                    int8_t* __restrict__ dst_row = dst + cc * HW;
-                    const int8_t* __restrict__ src_c = src + cc;   // NHWC stride = C
+    const cv::Mat& ref = c.outputs_nchw[idx];
+    const int C = ref.size[1], H = ref.size[2], W = ref.size[3];
+    int sz[] = {1, C, H, W};
+    dst.create(4, sz, CV_32F);   // 形狀相同就不重新配置
 
-                    int hw = hw0;
-                    const int hw_end4 = hw0 + ((hw_end - hw0) / 4) * 4;
-                    for (; hw < hw_end4; hw += 4) {
-                        dst_row[hw + 0] = src_c[(hw + 0) * C];
-                        dst_row[hw + 1] = src_c[(hw + 1) * C];
-                        dst_row[hw + 2] = src_c[(hw + 2) * C];
-                        dst_row[hw + 3] = src_c[(hw + 3) * C];
-                    }
-                    for (; hw < hw_end; ++hw)
-                        dst_row[hw] = src_c[hw * C];
-                }
-            }
-        }
+    const float s = output_scales_[idx];
+    transpose_blocked(nhwc_src(c, idx), dst.ptr<float>(), C, H * W,
+                      [s](int8_t v) { return static_cast<float>(v) * s; });
+}
+
+
+// ── int8 NCHW,lazy ──────────────────────────────────────────────
+const cv::Mat& XmodelPipelineEngine::output_mat_nchw(int ctx, size_t idx)
+{
+    Ctx& c = ctxs_.at(static_cast<size_t>(ctx));
+    if (idx >= c.outputs_nchw.size())
+        throw std::out_of_range("XmodelPipelineEngine::output_mat_nchw: idx 超出範圍");
+
+    if (!c.nchw_ready[idx]) {
+        cv::Mat& d = c.outputs_nchw[idx];
+        transpose_blocked(nhwc_src(c, idx), d.ptr<int8_t>(),
+                          d.size[1], d.size[2] * d.size[3],
+                          [](int8_t v) { return v; });
+        c.nchw_ready[idx] = 1;
     }
+    return c.outputs_nchw[idx];
 }

@@ -119,6 +119,13 @@ Result process(const cv::Mat& uyvy, int scale);
 bool downscale(const cv::Mat& uyvy, int scale, cv::Mat& rgb,
                Timing* timing = nullptr, int timeout_ms = 2000);
 
+// 輸入已經在「實體連續、cache 已 clean」的 DMA 記憶體裡(例如 V4L2 DMABUF
+// 直接寫進來的相機緩衝),直接把 in_phys 交給 IP,完全不經過 pool 的 staging。
+// 呼叫端保證:uyvy 連續(step == cols*2)、in_phys 是 uyvy.data 的實體位址、
+// 且 CPU 寫入的資料已經 clean 到記憶體。
+bool downscale_phys(const cv::Mat& uyvy, uint64_t in_phys, int scale, cv::Mat& rgb,
+                    Timing* timing = nullptr, int timeout_ms = 2000);
+
 // CPU 版,與 IP 位元完全一致(也是 process 的退路)
 bool reference(const cv::Mat& uyvy, int scale, cv::Mat& rgb);
 
@@ -171,10 +178,12 @@ struct LetterboxResult {
 // res.img 尺寸相同時會重用記憶體,放在迴圈外可避免每幀配置。
 // uyvy 必須是 CV_8UC2、寬為偶數。
 // allow_ip = false 時直接走 CPU(IP 出錯後用來避免每幀重試、每幀等逾時)。
+// in_phys != 0 時改走 downscale_phys(輸入已在 DMA 記憶體,條件同上)。
 // IP 失敗的詳細原因請看 last_error()。
 void letterbox(const cv::Mat& uyvy, int input_size, LetterboxResult& res,
-               bool allow_ip = true);
-LetterboxResult letterbox(const cv::Mat& uyvy, int input_size, bool allow_ip = true);
+               bool allow_ip = true, uint64_t in_phys = 0);
+LetterboxResult letterbox(const cv::Mat& uyvy, int input_size, bool allow_ip = true,
+                          uint64_t in_phys = 0);
 
 
 // ============================================================

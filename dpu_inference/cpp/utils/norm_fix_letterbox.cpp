@@ -20,14 +20,16 @@
 // ---------------------------------------------------------------------------
 // 編譯期路徑選擇
 // ---------------------------------------------------------------------------
-#if !defined(LBN_FORCE_GENERIC) && \
-    ((defined(__aarch64__) && defined(__ARM_NEON)) || defined(_M_ARM64))
-#define LBN_USE_NEON_LUT 1
-#include <arm_neon.h>
-#else
+// #if !defined(LBN_FORCE_GENERIC) && \
+//     ((defined(__aarch64__) && defined(__ARM_NEON)) || defined(_M_ARM64))
+// #define LBN_USE_NEON_LUT 1
+// #include <arm_neon.h>
+// #else
+// #define LBN_USE_NEON_LUT 0
+// #endif
+
 #define LBN_USE_NEON_LUT 0
-#endif
- 
+
 #if defined(__GNUC__)
 #define LBN_RESTRICT __restrict__
 #else
@@ -113,7 +115,20 @@ void lut_kernel(const uint8_t* LBN_RESTRICT src,
         p.val[2] = lookup256(tB, p.val[2]);
         vst3q_u8(d + 3*i, p);                   // 交錯寫回
     }
-    for (; i < total; ++i) {                    // 尾端不足 16 pixel
+    if (i == total) return;
+    if (total >= 16) {
+        // 尾端不足 16 pixel：往回對齊，重做最後 16 個 pixel。
+        // 重疊部分寫入的值完全相同，而且只寫在 [0, total) 內，不會碰到黑邊。
+        // （content 不是整列寬時會逐列呼叫，這樣每列都不用掉進純量迴圈）
+        i = total - 16;
+        uint8x16x3_t p = vld3q_u8(src + 3*i);
+        p.val[0] = lookup256(tR, p.val[0]);
+        p.val[1] = lookup256(tG, p.val[1]);
+        p.val[2] = lookup256(tB, p.val[2]);
+        vst3q_u8(d + 3*i, p);
+        return;
+    }
+    for (; i < total; ++i) {                    // 整段不到 16 pixel
         dst[3*i + 0] = lut[      src[3*i + 0]];
         dst[3*i + 1] = lut[256 + src[3*i + 1]];
         dst[3*i + 2] = lut[512 + src[3*i + 2]];
@@ -156,8 +171,9 @@ void float_kernel(const uint8_t* LBN_RESTRICT src,
 // 因此只要 out.data 與 held.data 相同，就一定是同一塊記憶體，
 // 不會發生「舊 buffer 釋放後，新 buffer 剛好配到同一個位址」而誤判的情況。
 struct PadRecord {
-    cv::Mat held;
-    int y0 = -1, y1 = -1, fix_point = INT_MIN;
+    cv::Mat  held;
+    cv::Rect content{-1, -1, -1, -1};
+    int      fix_point = INT_MIN;
 };
  
 constexpr int kMaxBuffers = 4;
@@ -200,60 +216,89 @@ void prepare(Cache& c, int fix_point)
     c.fix_point = fix_point;
 }
  
+// 對連續的 n 個 pixel 做正規化
+inline void run_kernel(const Cache& c, const uint8_t* src, int8_t* dst, std::ptrdiff_t n)
+{
+#if LBN_USE_NEON_LUT
+    lut_kernel(src, dst, n, c.lut);
+#else
+    float_kernel(src, dst, n, c.scale, c.bias);
+#endif
+}
+
 } // namespace
- 
+
 void norm_letterbox_reset()
 {
     cache() = Cache{};
 }
- 
-void norm_and_fix_letterbox(const cv::Mat& x, int fix_point, int y0, int y1, cv::Mat& out)
+
+void norm_and_fix_letterbox(const ResizeResult& r, int fix_point, cv::Mat& out)
+{
+    norm_and_fix_letterbox(r.img, fix_point, r.content, out);
+}
+
+void norm_and_fix_letterbox(const cv::Mat& x, int fix_point, const cv::Rect& content, cv::Mat& out)
 {
     CV_Assert(x.type() == CV_8UC3 && x.isContinuous());
-    CV_Assert(0 <= y0 && y0 <= y1 && y1 <= x.rows);
- 
+    CV_Assert(content.width >= 0 && content.height >= 0);
+    CV_Assert(0 <= content.x && content.x + content.width  <= x.cols);
+    CV_Assert(0 <= content.y && content.y + content.height <= x.rows);
+    CV_Assert(out.data == nullptr || out.data != x.data);   // 不支援原地運算
+
+    const int x0 = content.x, x1 = content.x + content.width;
+    const int y0 = content.y, y1 = content.y + content.height;
+
     Cache& c = cache();
- 
+
     // 1) 參數：只跟 fix_point 有關，改變時才重新準備
     if (c.fix_point != fix_point)
         prepare(c, fix_point);
- 
+
     // 2) 輸出 buffer：尺寸或型別不符才重新配置
     if (out.rows != x.rows || out.cols != x.cols || out.type() != CV_8SC3 || !out.isContinuous())
         out.create(x.rows, x.cols, CV_8SC3);
- 
+
     // 3) 黑邊：找這個 out buffer 的紀錄，參數都相同才跳過
     PadRecord* rec = nullptr;
-    for (PadRecord& r : c.pads)
-        if (!r.held.empty() && r.held.data == out.data) { rec = &r; break; }
- 
+    for (PadRecord& pr : c.pads)
+        if (!pr.held.empty() && pr.held.data == out.data) { rec = &pr; break; }
+
     const bool need_fill = !rec
-        || rec->y0 != y0 || rec->y1 != y1 || rec->fix_point != fix_point
+        || rec->content != content || rec->fix_point != fix_point
         || rec->held.rows != out.rows || rec->held.cols != out.cols;
- 
+
     if (need_fill) {
         const cv::Scalar v(c.pad[0], c.pad[1], c.pad[2]);
-        if (y0 > 0)         out.rowRange(0, y0).setTo(v);
-        if (y1 < out.rows)  out.rowRange(y1, out.rows).setTo(v);
- 
+        // 上下：整列
+        if (y0 > 0)        out.rowRange(0, y0).setTo(v);
+        if (y1 < out.rows) out.rowRange(y1, out.rows).setTo(v);
+        // 左右：只在內容列 [y0, y1) 內
+        if (y1 > y0) {
+            if (x0 > 0)        out(cv::Rect(0,  y0, x0,            y1 - y0)).setTo(v);
+            if (x1 < out.cols) out(cv::Rect(x1, y0, out.cols - x1, y1 - y0)).setTo(v);
+        }
+
         if (!rec) {                                              // 新的 buffer → 佔一個位置
             rec = &c.pads[c.next];
             c.next = (c.next + 1) % kMaxBuffers;
         }
         rec->held      = out;                                    // 持有參照，防止位址被重用
-        rec->y0        = y0;
-        rec->y1        = y1;
+        rec->content   = content;
         rec->fix_point = fix_point;
     }
- 
-    // 4) 只計算影像內容區域（整列切出的 rowRange 仍是連續記憶體）
-    const std::ptrdiff_t total = std::ptrdiff_t(y1 - y0) * x.cols;
-    if (total > 0) {
-#if LBN_USE_NEON_LUT
-        lut_kernel(x.ptr<uint8_t>(y0), out.ptr<int8_t>(y0), total, c.lut);
-#else
-        float_kernel(x.ptr<uint8_t>(y0), out.ptr<int8_t>(y0), total, c.scale, c.bias);
-#endif
+
+    // 4) 只計算 content 內的像素
+    if (x1 <= x0 || y1 <= y0) return;
+
+    if (x0 == 0 && x1 == x.cols) {
+        // 左右沒有黑邊：整塊 [y0, y1) 是連續記憶體，一次處理
+        const std::ptrdiff_t total = std::ptrdiff_t(y1 - y0) * x.cols;
+        run_kernel(c, x.ptr<uint8_t>(y0), out.ptr<int8_t>(y0), total);
+    } else {
+        // 左右有黑邊：逐列處理 [x0, x1)
+        const std::ptrdiff_t w = x1 - x0;
+        for (int y = y0; y < y1; ++y)
+            run_kernel(c, x.ptr<uint8_t>(y) + 3*x0, out.ptr<int8_t>(y) + 3*x0, w);
     }
 }
- 

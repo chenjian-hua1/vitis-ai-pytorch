@@ -20,14 +20,23 @@
 //  多出的 CPU 工作:
 //    - 只有要繪製 / 串流時,把 letterbox 後的小圖 RGB2BGR 一次
 //
-//  UYVY 緩衝由 input_buffer 配置在 DMA 記憶體,IP 讀取是 zero-copy。
+//  DPU 輸出(搭配 modelrunner_pipe v2):
+//    finish()               只做 memcpy(DPU_OUTPUT_STAGING=0 時什麼都不做)
+//    output_float_nchw()    NHWC int8 -> NCHW float,轉置與反量化一次完成,
+//                           取代原本的 output_mat_nchw() + fix2float()
+//    兩段分開計時,方便判斷 DPU 輸出緩衝是不是 uncached。
 //
-//  其餘架構不變:FrameGrabber 一條擷取執行緒 + 主執行緒串列處理,
-//  in-flight 固定 2 幀。
+//  擷取改用 DmabufCamera(V4L2 DMABUF import),不再經過 cv::VideoCapture:
+//    USB → [核心組幀] → 直接寫進 dma-heap 緩衝 → clean cache → IP 用實體位址讀
+//  中間沒有任何使用者空間的複製(VideoCapture 版本每幀 1080p 要搬 2~3 次 4 MB)。
+//  驅動不支援 DMABUF 時自動退回 MMAP + 一次複製。
+//
+//  架構:一條擷取執行緒(DQBUF + clean)+ 主執行緒串列處理,只取最新一幀。
 //
 //  環境變數:
 //    PIPE_CAM_CORE     擷取執行緒綁核
-//    PIPE_V4L2_BUFS    V4L2 buffer 數
+//    PIPE_V4L2_BUFS    V4L2 buffer 數(DMABUF 模式,預設 6)
+//    PIPE_DMA_HEAP     擷取緩衝用的 dma-heap 名稱(預設自動挑,排除 system)
 //    PIPE_UYVY_PHYS    uyvy_resize 控制暫存器實體位址(十六進位),
 //                      設了就走 /dev/mem;不設就用 UIO 名稱 "uyvy_resize"
 // ─────────────────────────────────────────────────────────────
@@ -37,11 +46,13 @@
 #include "stream.h"
 #include "drawer.h"
 #include "yolopproc.h"
-#include "camera.h"
+#include "camera.h"            // 只用到 Camera::Config(CLI 參數)
+#include "v4l2_dmabuf_camera.h"
 #include "preproc.h"
 #include "cli_args.h"
 #include "frame_pipeline.h"
 #include "hls_uyvy_resize.h"
+#include "norm_fix_letterbox.h"
 #include <opencv2/opencv.hpp>
 
 #include <algorithm>
@@ -80,16 +91,6 @@ inline void to_project_result(const hls::uyvy_resize::LetterboxResult& s,
     set_xy(d.pad,   s.pad.x,   s.pad.y);
 }
 
-// OpenCV 在 CONVERT_RGB=0 時,有些版本回傳 1xN 的 CV_8UC1 而不是 HxW 的
-// CV_8UC2。reshape 不動資料指標,所以仍然是 zero-copy。
-cv::Mat as_uyvy(const cv::Mat& raw, int w, int h) {
-    if (raw.type() == CV_8UC2 && raw.cols == w && raw.rows == h) return raw;
-    if (raw.isContinuous() &&
-        raw.total() * raw.elemSize() == static_cast<size_t>(w) * h * 2)
-        return raw.reshape(2, h);
-    return cv::Mat();
-}
-
 }  // namespace
 
 
@@ -109,39 +110,39 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
     const int in_h = engine.in_h();
 
     const int ch = 16;
-    const int no = engine.output_mat_nchw(0, 0).size[1];
+    const int no = engine.output_channels(0);       // 只讀形狀,不觸發轉置
     const int nc = no - 4 * ch;
     if (nc <= 0) { std::cerr << "輸出 channel 數與 DFL 假設不符\n"; return; }
     std::cout << "模型 " << in_w << "x" << in_h << "  nc=" << nc << "\n";
 
     YOLOPostProcessor yolo_pp(1, in_h, in_w, nc, ch);
     const int in_fix = static_cast<int>(std::round(std::log2(engine.input_scale())));
+    // out_fix 只用在第一幀的結果比對(舊路徑 fix2float)
     std::vector<int> out_fix(engine.num_outputs());
     for (size_t i = 0; i < engine.num_outputs(); ++i)
         out_fix[i] = static_cast<int>(std::round(-std::log2(engine.output_scale(i))));
 
-    // ---- 相機:強制 UYVY + raw,影格原封不動交出來 ----
-    if (cam_conf.fourcc != "UYVY") {
+    // ---- 相機:V4L2 DMABUF,影格直接落在 DMA 記憶體 ----
+    if (cam_conf.fourcc != "UYVY")
         std::cout << "[Camera] fourcc " << cam_conf.fourcc
                   << " 改為 UYVY(uyvy_resize IP 只吃 UYVY)\n";
-        cam_conf.fourcc = "UYVY";
-    }
-    cam_conf.raw_output = true;
-    if (cam_conf.buffer_count <= 0) cam_conf.buffer_count = 3;
-    if (const char* e = std::getenv("PIPE_V4L2_BUFS"))
-        cam_conf.buffer_count = std::max(2, std::atoi(e));
 
-    Camera cam(cam_conf);
-    if (!cam.open()) return;
-    const int cam_w = cam.actualWidth();
-    const int cam_h = cam.actualHeight();
+    DmabufCamera::Config dc;
+    dc.device = "/dev/video" + std::to_string(cam_conf.index);
+    dc.width  = cam_conf.width;
+    dc.height = cam_conf.height;
+    dc.fps    = cam_conf.fps;
+    if (const char* e = std::getenv("PIPE_V4L2_BUFS")) dc.num_buffers = std::max(4, std::atoi(e));
+    if (const char* e = std::getenv("PIPE_DMA_HEAP"))  dc.heap = e;
 
-    if (cam.actualFourcc() != "UYVY" || !cam.rawMode()) {
-        std::cerr << "[Camera] 拿不到 raw UYVY(實際 " << cam.actualFourcc()
-                  << (cam.rawMode() ? "" : ",OpenCV 仍在轉換")
-                  << "),此程式需要 UYVY 相機\n";
+    DmabufCamera cam(dc);
+    if (!cam.open()) {
+        std::cerr << "[Camera] 開啟失敗:" << cam.error() << "\n";
         return;
     }
+    std::cout << "[Camera] " << cam.describe() << "\n";
+    const int cam_w = cam.width();
+    const int cam_h = cam.height();
 
     // ---- letterbox 規劃:跟每一幀用的是同一個函式,開機時先看一次 ----
     const float r0 = std::min(1.0f, std::min(float(in_w) / cam_h, float(in_w) / cam_w));
@@ -152,9 +153,10 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
     const int sc = plan.use_ip ? static_cast<int>(plan.scale) : 1;
 
     // ---- DMA pool ----
+    // 擷取緩衝是 DmabufCamera 各自配的 dma-heap,不佔 pool;
+    // pool 只放 IP 輸出,以及開機 verify 測試圖的 staging。
     const size_t need =
-          static_cast<size_t>(cam_w) * cam_h * 2 * 3            // 3 塊 UYVY 擷取緩衝
-        + static_cast<size_t>(cam_w) * cam_h * 2                // staging 退路(非 zero-copy 時)
+          static_cast<size_t>(cam_w) * cam_h * 2                // verify 的 staging
         + static_cast<size_t>(cam_w / sc) * (cam_h / sc) * 3    // IP 輸出
         + 8u * 1024 * 1024;
     hls::use_dma_heap("auto", ((need >> 20) + 16) << 20);
@@ -198,14 +200,6 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
         }
     }
 
-    // 三塊擷取緩衝放在 DMA 記憶體 —— 相機影格落在這裡,
-    // uyvy_resize IP 直接讀,不必再搬一次。
-    std::vector<cv::Mat> cap_bufs(3);
-    for (int i = 0; i < 3; ++i) {
-        cap_bufs[i] = hls::input_buffer(cam_w, cam_h, i, CV_8UC2);
-        if (cap_bufs[i].empty()) cap_bufs[i].create(cam_h, cam_w, CV_8UC2);
-    }
-
     // ---- 串流 ----
     std::unique_ptr<RtpJpegStreamer> streamer;
     if (stream) {
@@ -221,23 +215,20 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
     bytetrack::BYTETracker tracker(tp);
 
     // tm_rsz 是整個 letterbox,tm_ip 是其中 IP 那段(含 sync)
-    fpipe::StageTimer tm_ip, tm_rsz, tm_pre, tm_dpu_hw, tm_dpu_cpu,
+    // tm_dpu_cpu 只有 finish()(memcpy),tm_tr 是轉置 + 反量化
+    fpipe::StageTimer tm_ip, tm_rsz, tm_pre, tm_dpu_hw, tm_dpu_cpu, tm_tr,
                       tm_post, tm_out, tm_lat;
     std::atomic<long long> n_proc{0};
     std::atomic<double> cur_fps{0.0};
     const double t_start = fpipe::now_ms();
 
-    // ===================== 擷取:FrameGrabber,不設 transform =====================
-    // 沒有 setTransform → 擷取執行緒只做 cap.read(),影格原樣寫進 DMA 緩衝。
-    FrameGrabber grabber(cam);
-    if (!grabber.setBuffers(cap_bufs))
-        std::cerr << "[FrameGrabber] setBuffers 失敗,改用內部配置的緩衝\n";
-    std::cout << "[排程] 擷取執行緒不做轉換,UYVY 直送 "
-              << "hls::uyvy_resize::letterbox\n";
-
-    grabber.start();
+    // ===================== 擷取:DmabufCamera =====================
+    if (!cam.start()) {
+        std::cerr << "[Camera] 串流啟動失敗:" << cam.error() << "\n";
+        return;
+    }
     if (cam_core >= 0) {
-        const bool ok = grabber.pinThread(cam_core);
+        const bool ok = cam.pinThread(cam_core);
         std::cout << "[排程] 擷取執行緒綁 core " << cam_core
                   << (ok ? " 成功" : " 失敗") << std::endl;
     }
@@ -253,39 +244,30 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
         double t_prev = fpipe::now_ms();
         fpipe::Ema fps_ema(0.3);
         bool first = true;
-        bool warned_copy = false, warned_shape = false;
+        bool warned_copy = false;
 
         while (g_running) {
-            FrameGrabber::Handle f = grabber.acquire(200);
+            DmabufCamera::Frame f = cam.acquire(200);
             if (!f.valid()) continue;
             const double t_cap_stamp = f.timestamp();
-
-            const cv::Mat uyvy = as_uyvy(f.mat(), cam_w, cam_h);
-            if (uyvy.empty()) {
-                if (!warned_shape) {
-                    warned_shape = true;
-                    std::cerr << "[Camera] 影格格式不符預期:" << f.mat().cols << "x"
-                              << f.mat().rows << " type=" << f.mat().type() << "\n";
-                }
-                continue;
-            }
+            const cv::Mat& uyvy = f.mat();              // 就在 DMA 記憶體裡
 
             // ---- letterbox:UYVY 進,RGB 正方形出 ----
             double t0 = fpipe::now_ms();
-            hls::uyvy_resize::letterbox(uyvy, in_w, lb, ip_enabled);
+            hls::uyvy_resize::letterbox(uyvy, in_w, lb, ip_enabled, f.phys());
             to_project_result(lb, rr);
             tm_rsz.add(fpipe::now_ms() - t0);
 
             // UYVY 已經讀完(lb.img 是另一塊記憶體),立刻歸還緩衝給擷取端
-            f = FrameGrabber::Handle();
+            f.reset();
 
             if (lb.used_ip) {
                 tm_ip.add(lb.ip_ms);
                 if (!lb.zero_copy && !warned_copy) {
                     warned_copy = true;
-                    std::cerr << "[uyvy_resize] 輸入不在 DMA 記憶體,每幀多一次複製 "
+                    std::cerr << "[uyvy_resize] 輸入沒有走實體位址,每幀多一次複製 "
                               << std::fixed << std::setprecision(2) << lb.timing.copy_ms
-                              << " ms(OpenCV 可能重新配置了擷取緩衝)\n";
+                              << " ms\n";
                 }
             } else if (ip_enabled) {
                 // 這一幀 IP 失敗:印出真正的原因,之後不再重試
@@ -301,7 +283,7 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
             // ---- 前處理:已經是 RGB,不用再 cvtColor ----
             t0 = fpipe::now_ms();
             cv::Mat dpu_in = engine.input_mat(0);
-            norm_and_fix(rr.img, in_fix, dpu_in);
+            norm_and_fix_letterbox(rr, in_fix, dpu_in);
             tm_pre.add(fpipe::now_ms() - t0);
 
             // ---- DPU ----
@@ -310,14 +292,29 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
             engine.wait_hw(0);
             tm_dpu_hw.add(fpipe::now_ms() - t0);
 
+            // ---- DPU 輸出 memcpy(STAGING=0 時接近 0)----
             t0 = fpipe::now_ms();
             engine.finish(0);
             tm_dpu_cpu.add(fpipe::now_ms() - t0);
 
-            // ---- 後處理 + 追蹤 ----
+            // ---- 轉置 + 反量化:NHWC int8 -> NCHW float ----
             t0 = fpipe::now_ms();
             for (size_t i = 0; i < engine.num_outputs(); ++i)
-                fix2float(engine.output_mat_nchw(0, i), out_fix[i], float_outputs[i]);
+                engine.output_float_nchw(0, i, float_outputs[i]);
+            tm_tr.add(fpipe::now_ms() - t0);
+
+            // 第一幀和舊路徑(int8 轉置 + fix2float)比對一次,最大差應為 0
+            if (first) {
+                cv::Mat ref;
+                for (size_t i = 0; i < engine.num_outputs(); ++i) {
+                    fix2float(engine.output_mat_nchw(0, i), out_fix[i], ref);
+                    std::cout << "[check] out" << i << " 最大差 "
+                              << cv::norm(ref, float_outputs[i], cv::NORM_INF) << "\n";
+                }
+            }
+
+            // ---- 後處理 + 追蹤(不再含 fix2float)----
+            t0 = fpipe::now_ms();
             const std::vector<DetectionBatch>& nms =
                 yolo_pp.process(float_outputs, conf_th, iou_th);
             map_detections(nms[0], boxes, 0.f, 0.f, 1.f, 1.f, cv::Size(in_w, in_w));
@@ -354,45 +351,51 @@ void run_camera(std::string xmodel_path, Camera::Config cam_conf,
                 };
                 std::cout << "Frame " << frames
                           << "  FPS " << std::fixed << std::setprecision(1) << cur_fps.load()
-                          << " | cam " << std::setprecision(1)
-                          << grabber.avgCaptureMs() << "/" << grabber.maxCaptureMs()
+                          << " | cam prep " << std::setprecision(2) << cam.avgPrepMs()
+                          << std::setprecision(1)
                           << "  lbox " << w(tm_rsz)
                           << " (ip " << w(tm_ip) << ")"
                           << "  pre " << w(tm_pre)
                           << "  dpu " << w(tm_dpu_hw)
-                          << "  轉置 " << w(tm_dpu_cpu)
+                          << "  memcpy " << w(tm_dpu_cpu)
+                          << "  轉置 " << w(tm_tr)
                           << "  post " << w(tm_post)
                           << "  out " << w(tm_out)
                           << "  | 延遲 " << w(tm_lat)
-                          << "  過期 " << grabber.staleSkipped()
-                          << "  略過 " << grabber.overwritten() << std::endl;
+                          << "  過期 " << cam.stale()
+                          << "  略過 " << cam.overwritten()
+                          << "  壞幀 " << cam.badFrames() << std::endl;
             }
         }
     }
 
     g_running = false;
-    grabber.stop();
+    cam.stop();
 
     const double wall = (fpipe::now_ms() - t_start) / 1000.0;
     cam.close();
     if (streamer) streamer->close();
 
     const double proc = tm_rsz.avg() + tm_pre.avg() + tm_dpu_hw.avg()
-                      + tm_dpu_cpu.avg() + tm_post.avg() + tm_out.avg();
+                      + tm_dpu_cpu.avg() + tm_tr.avg()
+                      + tm_post.avg() + tm_out.avg();
     const double hw = tm_dpu_hw.avg() + tm_ip.avg();
 
     std::cout << "\n──────── 統計 ────────\n"
               << "處理 " << n_proc.load() << " 幀,"
-              << "擷取 " << grabber.frameId() << " 幀,"
-              << "推掉 V4L2 舊幀 " << grabber.staleSkipped() << ",略過 "
-              << grabber.overwritten() << "\n\n"
+              << "擷取 " << cam.frames() << " 幀,"
+              << "推掉 V4L2 舊幀 " << cam.stale() << ",略過 "
+              << cam.overwritten() << ",壞幀 " << cam.badFrames() << "\n\n"
               << std::fixed << std::setprecision(2)
-              << "  擷取(raw UYVY)     " << grabber.avgCaptureMs() << " ms\n"
+              << "  擷取端 copy+clean   " << cam.avgPrepMs() << " ms  ("
+              << (cam.zeroCopy() ? "DMABUF 零複製,只有 clean" : "MMAP,含一次複製")
+              << ",在擷取執行緒)\n"
               << "  letterbox           " << tm_rsz.avg()
               << " ms  (其中 uyvy_resize IP " << tm_ip.avg() << " ms)\n"
               << "  前處理              " << tm_pre.avg()  << " ms\n"
               << "  DPU 硬體            " << tm_dpu_hw.avg() << " ms\n"
-              << "  DPU 輸出整理        " << tm_dpu_cpu.avg() << " ms\n"
+              << "  DPU 輸出 memcpy     " << tm_dpu_cpu.avg() << " ms\n"
+              << "  轉置 + 反量化       " << tm_tr.avg() << " ms\n"
               << "  後處理 + 追蹤       " << tm_post.avg() << " ms\n"
               << "  繪製 + 串流         " << tm_out.avg()  << " ms\n"
               << "  ── 處理端合計       " << proc << " ms\n"
