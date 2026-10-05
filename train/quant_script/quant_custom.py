@@ -289,8 +289,9 @@ def forward_loop(model, val_loader):
     model = model.to(device)
     with torch.no_grad():
         for samples, _ in tqdm(val_loader, desc="Calibrating"):
-            samples = norm(samples.to(device).float())
-            samples = samples.to(device).float() / 255.
+            # samples = norm(samples.to(device).float())
+            # samples = samples.to(device).float() / 255.
+            samples = norm(samples.to(device))
             model(samples)
 
 
