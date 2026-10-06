@@ -1,12 +1,5 @@
 // modelrunner_pipe.cpp
 
-#ifndef DPU_SYNC_CACHE
-#define DPU_SYNC_CACHE 1
-#endif
-#ifndef DPU_OUTPUT_STAGING
-#define DPU_OUTPUT_STAGING 1
-#endif
-
 #include "modelrunner_pipe.h"
 
 #include <xir/graph/graph.hpp>
@@ -177,29 +170,26 @@ void XmodelPipelineEngine::wait_hw(int ctx)
 #endif
 }
 
-
-// ── 只做 memcpy(STAGING=0 時什麼都不做)───────────────────────────
-void XmodelPipelineEngine::finish(int ctx)
+// 決定是否要將資料從ddr copy to cache
+void XmodelPipelineEngine::finish(int ctx, bool copy_to_staging)
 {
     Ctx& c = ctxs_.at(static_cast<size_t>(ctx));
-
-#if DPU_OUTPUT_STAGING
-    for (size_t i = 0; i < c.out_tb.size(); ++i)
-        std::memcpy(c.cache_buf[i].data(), c.outputs[i].ptr<int8_t>(),
-                    c.out_tb[i]->get_tensor()->get_data_size());
-#endif
-
+ 
+    if (copy_to_staging) {
+        for (size_t i = 0; i < c.out_tb.size(); ++i)
+            std::memcpy(c.cache_buf[i].data(), c.outputs[i].ptr<int8_t>(),
+                        c.out_tb[i]->get_tensor()->get_data_size());
+    }
+    c.staged = copy_to_staging;
+ 
     std::fill(c.nchw_ready.begin(), c.nchw_ready.end(), 0);
 }
 
-
+// (6) nhwc_src()：取代原本的實作（改成依執行時的狀態決定）
 const int8_t* XmodelPipelineEngine::nhwc_src(const Ctx& c, size_t i) const
 {
-#if DPU_OUTPUT_STAGING
-    return c.cache_buf[i].data();
-#else
-    return c.outputs[i].ptr<int8_t>();
-#endif
+    return c.staged ? c.cache_buf[i].data()
+                    : c.outputs[i].ptr<int8_t>();
 }
 
 
@@ -236,4 +226,17 @@ const cv::Mat& XmodelPipelineEngine::output_mat_nchw(int ctx, size_t idx)
         c.nchw_ready[idx] = 1;
     }
     return c.outputs_nchw[idx];
+}
+
+// 取得DPU的原始資料(不轉置)
+cv::Mat XmodelPipelineEngine::output_mat_nhwc(int ctx, size_t idx) const
+{
+    const Ctx& c = ctxs_.at(static_cast<size_t>(ctx));
+    if (idx >= c.outputs_nchw.size())
+        throw std::out_of_range("XmodelPipelineEngine::output_mat_nhwc: idx 超出範圍");
+ 
+    // 形狀沿用 outputs_nchw 記錄的 (1, C, H, W)，排成 NHWC
+    const cv::Mat& ref = c.outputs_nchw[idx];
+    const int sz[] = {1, ref.size[2], ref.size[3], ref.size[1]};   // 1, H, W, C
+    return cv::Mat(4, sz, CV_8S, const_cast<int8_t*>(nhwc_src(c, idx)));
 }

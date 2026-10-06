@@ -22,6 +22,14 @@
 
 #pragma once
 
+#ifndef DPU_SYNC_CACHE
+#define DPU_SYNC_CACHE 1
+#endif
+#ifndef DPU_OUTPUT_STAGING
+#define DPU_OUTPUT_STAGING 1
+#endif
+
+
 #include <opencv2/opencv.hpp>
 
 #include <cstdint>
@@ -60,13 +68,24 @@ public:
     // 等同 output_mat_nchw() + fix2float(),但只走一次記憶體。
     // dst 形狀相同時不會重新配置。
     void output_float_nchw(int ctx, size_t idx, cv::Mat& dst);
+    // NHWC int8 原始輸出（1, H, W, C），不轉置、不反量化。
+    // 回傳的 Mat 只是 header，指向上一次 finish() 決定的資料位置：
+    //   有複製 → cacheable 暫存區；沒複製 → DPU 輸出緩衝
+    // 所以必須在 finish(ctx, ...) 之後取得。
+    cv::Mat output_mat_nhwc(int ctx, size_t idx) const;    // (1, H, W, C) int8，不轉置、不反量化
 
     // NHWC int8 -> NCHW int8,lazy,同一幀內第二次呼叫直接回傳
     const cv::Mat& output_mat_nchw(int ctx, size_t idx);
 
     void submit(int ctx);
     void wait_hw(int ctx);
-    void finish(int ctx);
+    // DPU 輸出整理（純 CPU）
+    //   copy_to_staging = true  : memcpy 到 cacheable 暫存區，之後的輸出函式讀暫存區
+    //   copy_to_staging = false : 不複製，之後的輸出函式直接讀 DPU 輸出緩衝
+    // 必須在 wait_hw(ctx) 之後呼叫；每一幀都要呼叫（也會重設 lazy 轉置的狀態）
+    void finish(int ctx, bool copy_to_staging = true);
+    // 上一次 finish(ctx, ...) 是否有複製到暫存區
+    bool output_staged(int ctx) const { return ctxs_.at(ctx).staged; }
 
 private:
     struct Ctx {
@@ -78,6 +97,7 @@ private:
         std::vector<std::vector<int8_t>> cache_buf;
         std::vector<uint8_t> nchw_ready;
         std::pair<uint32_t, int> job{};
+        bool staged = false;     // 上一次 finish() 是否有複製到 cache_buf
     };
 
     void build_ctx(const xir::Subgraph* sg, Ctx& c, bool first);
