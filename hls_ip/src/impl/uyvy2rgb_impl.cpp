@@ -5,6 +5,7 @@
  *****************************************************************************/
 
 #include "uyvy2rgb_impl.h"
+#include <hls_dsp_builtins.h>
 
 /* =====================================================================
  *  out = in - 128
@@ -17,12 +18,28 @@ void subtract_128(ap_uint<8> &in, ap_int<8> &out) {
 }
 
 /* =====================================================================
- *  acc = w * x + b
+ *
+ *  acc = w * x + b   （void 版，介面與原本相同）
+ *
  *  Use one DSP48E2 three pipelined for multiply and accumulate operation
+ *
+ *  A(27b) <- w，B(18b) <- x，C(48b) <- b，P(48b) -> acc
+ *
+ *  暫存器：A1、B1、C、M、P
+ *
  * ===================================================================== */
-void mac(dsp_w_t &w, dsp_x_t &x, dsp_acc_t &b, dsp_acc_t &acc) {
-    acc = w * x + b;
-#pragma HLS BIND_OP variable=acc op=mul impl=dsp latency=3
+void mac(dsp_w_t &w, dsp_x_t &x, dsp_acc_t &b, dsp_acc_t &acc)
+{
+    using namespace hls::dsp48e2;                 /* <- 依 header 確認 */
+
+    ap_int<27> A = (ap_int<27>)w;                 /* w、x 若為 ap_fixed，需改取原始位元 */
+    ap_int<18> B = (ap_int<18>)x;
+    ap_int<48> C = (ap_int<48>)b;
+
+    ap_int<48> P = mul_add<REG_A1 | REG_B1 | REG_C |
+                           REG_M  | REG_P>(A, B, C);   /* <- 函式名稱與旗標依 header 確認 */
+
+    acc = (dsp_acc_t)P;
 }
 
 /* =====================================================================
@@ -51,6 +68,7 @@ void clamp_s(ap_int<10> &v, ap_uint<8> &out) {
  *      bit  8: 0 : w_lo  Q1.8    低位欄位
  * ===================================================================== */
 void cvt_core(ap_uint<8> &y, ap_int<8> &d, ap_int<8> &e, ap_uint<24> &pixel) {
+
     uvy_w_t d_wlo = 1.772, d_whi = 0.344136, e_wlo = 1.402, e_whi = 0.714136;
 
     // ---- D dsp ----
@@ -132,7 +150,8 @@ void cvt_core(ap_uint<8> &y, ap_int<8> &d, ap_int<8> &e, ap_uint<24> &pixel) {
 void cvt_pair(ap_uint<8> y0, ap_uint<8> y1,
               ap_uint<8> u,  ap_uint<8> v,
               ap_uint<24> &px0, ap_uint<24> &px1) {
-#pragma HLS INLINE
+// #pragma HLS INLINE
+#pragma HLS PIPELINE II=1
     uvy_w_t d_wlo = 1.772, d_whi = 0.344136, e_wlo = 1.402, e_whi = 0.714136;
 
     ap_int<8> d, e;

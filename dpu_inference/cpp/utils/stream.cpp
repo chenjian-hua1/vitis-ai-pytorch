@@ -63,6 +63,9 @@ std::string build_pipeline(const std::string& ip, int port, int quality)
     if (env_on("STREAM_LIVE"))
         p << " is-live=true do-timestamp=true format=time";
     p << " ! video/x-raw,format=BGR ";
+    
+    // 資料實際是 RGB 時，只改標籤（不複製、不轉換）
+    p << "! capssetter caps=video/x-raw,format=RGB ";
 
     if (!env_on("STREAM_NO_QUEUE"))
         p << "! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 "

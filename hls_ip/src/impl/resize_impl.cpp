@@ -19,7 +19,6 @@
  * ================================================================ */
 ap_uint<PROD_W> dsp_addmul(ap_uint<OPW> a, ap_uint<OPW> d, ap_uint<SRW> b)
 {
-#pragma HLS INLINE
     using namespace hls::dsp48e2;              /* <- 依 header 確認 */
 
     ap_int<27> A = a;                          /* 零延伸，值域為正 */
@@ -61,7 +60,6 @@ void dsp_shared(bool             pack,
                        ap_uint<PROD_W> &p_hi,
                        ap_uint<PROD_W> &p_lo)
 {
-#pragma HLS INLINE
     ap_uint<OPW> A2 = (a_hi, a_lo);            /* 打包：{hi, lo} */
     ap_uint<OPW> D2 = (d_hi, d_lo);
     ap_uint<OPW> A  = pack ? A2 : (ap_uint<OPW>)a_lo;
@@ -80,8 +78,7 @@ void dsp_shared(bool             pack,
 
 /* ================================================================
  *  resize PE：一顆 DSP 份的運算
- *
- *    h0 = u0 + u1，h1 = u2 + v            （兩種模式共用這兩個加法器）
+ * *    h0 = u0 + u1，h1 = u2 + v            （兩種模式共用這兩個加法器）
  *    3 倍：只用 lo 組，a = h0 (p0+p1)，d = h1 (p2+line_buf)
  *    2 倍：hi 組 = 較左欄，a = h0 (p0+p1)，d = line_buf[i]
  *          lo 組 = 較右欄，a = h1 (p2+p3)，d = line_buf[i+1]
@@ -98,7 +95,7 @@ void resize_pe(ap_uint<8>       u0,
                ap_uint<PROD_W> &p_hi,
                ap_uint<PROD_W> &p_lo)
 {
-#pragma HLS INLINE
+#pragma HLS PIPELINE II=1
     ap_uint<ACCW> h0    = u0 + u1;
     ap_uint<ACCW> h1    = u2 + v;
     ap_uint<ACCW> lb_hi = lbp.range(OPW  - 1, ACCW);
