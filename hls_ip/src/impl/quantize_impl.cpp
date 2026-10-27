@@ -2,9 +2,14 @@
 #include "quantize_lut.h"
 
 void quantize_core(const ap_uint<48> &input, ap_uint<48> &output) {
-#pragma HLS BIND_STORAGE variable=kLut.r type=rom_2p impl=lutram
-#pragma HLS BIND_STORAGE variable=kLut.g type=rom_2p impl=lutram
-#pragma HLS BIND_STORAGE variable=kLut.b type=rom_2p impl=lutram
+// #pragma HLS BIND_STORAGE variable=kLut.r type=rom_2p impl=lutram
+// #pragma HLS BIND_STORAGE variable=kLut.g type=rom_2p impl=lutram
+// #pragma HLS BIND_STORAGE variable=kLut.b type=rom_2p impl=lutram
+
+// rom_np : tool auto allocate how roms, which can achieve the timing setting 
+#pragma HLS BIND_STORAGE variable=kLut.r type=rom_np impl=lutram
+#pragma HLS BIND_STORAGE variable=kLut.g type=rom_np impl=lutram
+#pragma HLS BIND_STORAGE variable=kLut.b type=rom_np impl=lutram
 
     // 48 bits = 2 pixel 
     // Pixel 24bit: [R:23..16][G:15..8][B:7..0]
