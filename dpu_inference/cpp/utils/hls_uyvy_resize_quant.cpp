@@ -5,12 +5,29 @@
 //   2. Kernel      繼承 AxiLiteIp,只負責寫參數暫存器
 //   3. device()    IpHolder 單例 + 註冊 clear_buffers
 //   4. API         include/hls_uyvy_resize_quant.h 宣告的函式
+//
+// 本版修改(量化):
+//   - quant_byte() 原本是佔位用的 int8(v - 128),與 IP / norm_and_fix_letterbox 的公式完全不同。
+//     改為 quant_byte(v, ch):直接查 quantize_lut.h 的 kLut(與 IP 的 ROM 是同一份),
+//     即 norm_and_fix_letterbox 在 fix_point = kFixPoint 時的結果(每通道不同的 mean/std)。
+//   - 受影響的地方一併修正:verify 的參考值、letterbox 的 quant 黑邊(每通道不同)、
+//     零頭縮放後的 CPU 重新量化、CPU 退路。
+//   - 新增 ip_fix_point() / quant_pad(),讓呼叫端比對 xmodel 的 fix_point、取得黑邊值。
+//   - verify 的 quant 不符時,自動判斷 IP 實際相當於哪個 fix_point、或是否 R/B 對調。
+//
+// 本版修改(letterbox 效能):
+//   - quant 可直接寫進呼叫端提供的 Mat(例如 DPU 輸入緩衝),省掉 res.quant → DPU 輸入的一次複製;
+//     也可以完全不產生 quant(呼叫端改用 norm_and_fix_letterbox 時)。
+//   - 黑邊不再每幀重填:同一塊 buffer、同一個內容區、同一個填值只填一次
+//     (持有 buffer 的參照,位址不會被重新配置給別人,不會誤判)。
 
 #include "hls_uyvy_resize_quant.h"
+#include "../../../hls_ip/src/impl/quantize_lut.h"        // 與 HLS 共用:kLut / kFixPoint(ARM 端編譯時請拿掉其中的 #include <ap_int.h>)
 
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -33,14 +50,13 @@ namespace {
 //  1. 硬體資訊
 // ============================================================
 
-// TODO(請確認):以下位址與 UIO 名稱沿用舊 uyvy_resize,
-// 新 bitstream 的 pl.dtsi 若不同,請改成實際值,例如:
-//   uyvy_resize_quant_0: uyvy_resize_quant@a0000000 { reg = <0x0 0xa0000000 0x0 0x10000>; }
+// 來自板子的實測:/proc/device-tree/amba_pl/uyvyResizeQuant@a0000000
+//   位址 0xA0000000 已確認;節點名是駝峰式 "uyvyResizeQuant"(不是 uyvy_resize_quant)
 constexpr uint64_t    kCtrlPhys = 0xA0000000ull;
 constexpr size_t      kCtrlSpan = 0x10000;
 
 // uio_pdrv_genirq 的名稱 = 裝置樹節點名去掉 @位址
-constexpr const char* kUioName  = "uyvy_resize_quant";
+constexpr const char* kUioName  = "uyvyResizeQuant";
 
 // UIO 找不到時改用 /dev/mem(需 root、輪詢、無中斷)。
 // 只有 /proc/device-tree 找得到這顆 IP 的節點時才啟用,避免對不存在的 PL 位址存取造成卡死。
@@ -126,6 +142,59 @@ std::string& run_error() {
 
 
 // ============================================================
+//  黑邊快取
+//
+//  記錄每塊 buffer 的黑邊是以什麼內容區、什麼值填的;全部相同就跳過。
+//  held 持有 buffer 的一份參照(引用計數 +1),確保它不會被釋放,
+//  因此「data 相同」一定是同一塊記憶體,不會發生舊 buffer 釋放後新 buffer 配到同一位址的誤判。
+//  (外部記憶體包成的 Mat 沒有引用計數,持有它不影響任何事。)
+//  thread_local:每個執行緒各自一份,不需要鎖。
+// ============================================================
+class BorderCache {
+public:
+    void fill(cv::Mat& m, const cv::Rect& c, const cv::Scalar& v) {
+        for (Rec& r : recs_) {
+            if (r.held.data != m.data) continue;
+            if (r.held.rows == m.rows && r.held.cols == m.cols && r.held.type() == m.type() &&
+                r.content == c && r.value == v)
+                return;                                        // 已經是正確的黑邊
+            paint(m, c, v);                                    // 同一塊 buffer,參數變了 → 重填
+            r = Rec{m, c, v};
+            return;
+        }
+        paint(m, c, v);                                        // 新的 buffer → 佔一個位置
+        recs_[next_] = Rec{m, c, v};
+        next_ = (next_ + 1) % kN;
+    }
+    void clear() { for (Rec& r : recs_) r = Rec{}; next_ = 0; }
+
+private:
+    static void paint(cv::Mat& m, const cv::Rect& c, const cv::Scalar& v) {
+        const int x0 = c.x, x1 = c.x + c.width, y0 = c.y, y1 = c.y + c.height;
+        if (y0 > 0)      m.rowRange(0, y0).setTo(v);
+        if (y1 < m.rows) m.rowRange(y1, m.rows).setTo(v);
+        if (y1 > y0) {
+            if (x0 > 0)      m(cv::Rect(0,  y0, x0,          y1 - y0)).setTo(v);
+            if (x1 < m.cols) m(cv::Rect(x1, y0, m.cols - x1, y1 - y0)).setTo(v);
+        }
+    }
+    struct Rec {
+        cv::Mat    held;
+        cv::Rect   content{-1, -1, -1, -1};
+        cv::Scalar value;
+    };
+    static constexpr int kN = 4;          // RGB 畫布 + 幾塊 DPU 輸入緩衝,4 個足夠
+    Rec recs_[kN];
+    int next_ = 0;
+};
+
+BorderCache& border_cache() {
+    thread_local BorderCache c;
+    return c;
+}
+
+
+// ============================================================
 //  CPU 位元一致模型
 //
 //  UYVY → RGB(與 IP 的 cvt_pair 一致):
@@ -134,7 +203,8 @@ std::string& run_error() {
 //      G = clamp(Y - floor((88*d + 183*e) / 256))
 //      B = clamp(Y + floor(454*d / 256))
 //  box filter:(sum * inv_scale) >> 16,2 倍 16384、3 倍 7282
-//  quant:quant_byte()(★假設★ int8(v - 128))
+//  quant:quant_byte(v, ch) = kLut(與 IP 的 ROM 同一份)
+//        = norm_and_fix_letterbox(fix_point = kFixPoint)
 // ============================================================
 inline int floor_div256(int x) {
     return (x >= 0) ? (x >> 8) : -((-x + 255) >> 8);
@@ -156,15 +226,47 @@ void convert_row(const uint8_t* src, uint8_t* dst, int width) {
     }
 }
 
-// 把一塊 CV_8UC3 的 RGB 逐 byte 量化到同尺寸的 CV_8SC3
+// 把一塊 CV_8UC3 的 RGB 逐 byte 量化到同尺寸的 CV_8SC3(byte 順序 R,G,B → 通道 = 位置 % 3)
 void quantize_mat(const cv::Mat& rgb, cv::Mat& q) {
     CV_Assert(rgb.type() == CV_8UC3 && q.type() == CV_8SC3 && rgb.size() == q.size());
     const int n = rgb.cols * 3;
     for (int y = 0; y < rgb.rows; ++y) {
         const uint8_t* s = rgb.ptr<uint8_t>(y);
         int8_t*        d = q.ptr<int8_t>(y);
-        for (int i = 0; i < n; ++i) d[i] = quant_byte(s[i]);
+        for (int i = 0; i < n; i += 3) {
+            d[i + 0] = static_cast<int8_t>(kLut.r[s[i + 0]]);
+            d[i + 1] = static_cast<int8_t>(kLut.g[s[i + 1]]);
+            d[i + 2] = static_cast<int8_t>(kLut.b[s[i + 2]]);
+        }
     }
+}
+
+// ---- 診斷用:norm_and_fix_letterbox 的公式(任意 fix_point),只在 verify 失敗時使用 ----
+int8_t normfix_formula(int v, int ch, int fix_point) {
+    static const double mean[3] = {0.485, 0.456, 0.406};
+    static const double stdv[3] = {0.229, 0.224, 0.225};
+    const double fp = std::ldexp(1.0, fix_point);
+    const double y  = v * (1. / (stdv[ch] * 255.) * fp) + (-mean[ch] / stdv[ch] * fp);
+    return static_cast<int8_t>(y < -128. ? -128. : (y > 127. ? 127. : y));
+}
+
+// IP 的 quant 是否等於某個 fix_point 的 norm_and_fix(swap_rb:R/B 的表對調)。
+// rgb 必須是正確的 RGB(verify 中 RGB 已確認一致時才呼叫)。回傳吻合的 fix_point,找不到回傳 INT_MIN。
+int match_fix_point(const cv::Mat& rgb, const cv::Mat& q, int out_w, int out_h, bool swap_rb) {
+    for (int fp = 0; fp <= 10; ++fp) {
+        bool ok = true;
+        for (int y = 0; ok && y < out_h; ++y) {
+            const uint8_t* s = rgb.ptr<uint8_t>(y);
+            const int8_t*  d = q.ptr<int8_t>(y);
+            for (int i = 0; i < out_w * 3; ++i) {
+                const int c  = i % 3;
+                const int lc = swap_rb ? 2 - c : c;          // IP 用來查這個 byte 的表
+                if (d[i] != normfix_formula(s[i], lc, fp)) { ok = false; break; }
+            }
+        }
+        if (ok) return fp;
+    }
+    return INT_MIN;
 }
 
 bool check_input(const cv::Mat& uyvy, int scale, Params& p, const char*& why) {
@@ -188,10 +290,23 @@ bool check_input(const cv::Mat& uyvy, int scale, Params& p, const char*& why) {
 
 
 // ============================================================
-//  量化
+//  量化(與 IP 的 ROM 完全相同)
 // ============================================================
-int8_t quant_byte(uint8_t v) {
-    return static_cast<int8_t>(static_cast<int>(v) - 128);
+
+// ch:0 = R、1 = G、2 = B
+int8_t quant_byte(uint8_t v, int ch) {
+    const unsigned char* t = (ch == 0) ? kLut.r : (ch == 1) ? kLut.g : kLut.b;
+    return static_cast<int8_t>(t[v]);
+}
+
+// IP 的量化 LUT 編譯時的 fix_point;必須等於 xmodel 輸入的 fix_point
+int ip_fix_point() {
+    return kFixPoint;
+}
+
+// 黑色 (0,0,0) 量化後的值(letterbox 的 quant 黑邊),每個通道不同
+cv::Scalar quant_pad() {
+    return cv::Scalar(quant_byte(0, 0), quant_byte(0, 1), quant_byte(0, 2));
 }
 
 
@@ -234,7 +349,7 @@ Params Params::make(uint32_t in_w, uint32_t in_h, uint32_t scale) {
     p.in_bytes    = in_w * in_h * 2u;
     p.out_bytes   = p.out_w * p.out_h * 3u;
     p.out_words   = (p.out_bytes + 15u) / 16u;
-    p.quant_bytes = p.out_bytes;                    // 假設 quant 與 RGB 同尺寸、同 word 對齊
+    p.quant_bytes = p.out_bytes;                    // quant 與 RGB 同尺寸、同 word 對齊
     p.quant_words = (p.quant_bytes + 15u) / 16u;
     return p;
 }
@@ -242,11 +357,11 @@ Params Params::make(uint32_t in_w, uint32_t in_h, uint32_t scale) {
 std::string Params::describe() const {
     char b[384];
     std::snprintf(b, sizeof b,
-                  "UYVY %ux%u -> RGB+quant %ux%u (%u 倍, scale_mode=%u)\n"
+                  "UYVY %ux%u -> RGB+quant %ux%u (%u 倍, scale_mode=%u, quant fix_point=%d)\n"
                   "  in_bytes    = %u\n"
                   "  out_bytes   = %u (words = %u%s)\n"
                   "  quant_bytes = %u (words = %u)",
-                  in_w, in_h, out_w, out_h, scale, scale_mode,
+                  in_w, in_h, out_w, out_h, scale, scale_mode, kFixPoint,
                   in_bytes,
                   out_bytes, out_words, (out_bytes % 16) ? ",最後一個 word 補 0" : "",
                   quant_bytes, quant_words);
@@ -377,7 +492,7 @@ bool downscale_phys(const cv::Mat& uyvy, uint64_t in_phys, int scale,
 
 
 // ============================================================
-//  4-4. reference —— CPU 位元一致模型
+//  4-4. reference —— CPU 位元一致模型(RGB 與 quant 都與 IP 位元一致)
 // ============================================================
 bool reference(const cv::Mat& uyvy, int scale, cv::Mat& rgb, cv::Mat* quant) {
     Params p;
@@ -441,7 +556,7 @@ Result process(const cv::Mat& uyvy, int scale) {
         return res;
     }
 
-    // ---- 退路:結果位元完全相同,只是比較慢 ----
+    // ---- 退路:RGB 與 quant 都與 IP 位元一致(quant 用同一份 kLut),只是比較慢 ----
     const Stopwatch cpu;
     reference(uyvy, scale, res.rgb, &res.quant);
     res.timing = Timing{};
@@ -483,7 +598,7 @@ Plan plan_for(uint32_t in_w, uint32_t in_h, uint32_t need_w, uint32_t need_h) {
 }
 
 void letterbox(const cv::Mat& uyvy, int input_size, LetterboxResult& res,
-               bool allow_ip, uint64_t in_phys) {
+               bool allow_ip, uint64_t in_phys, cv::Mat* quant_dst, bool want_quant) {
     CV_Assert(!uyvy.empty() && uyvy.type() == CV_8UC2 && input_size > 0);
 
     const int orig_h = uyvy.rows, orig_w = uyvy.cols;
@@ -506,28 +621,30 @@ void letterbox(const cv::Mat& uyvy, int input_size, LetterboxResult& res,
     res.pad     = {dw, dh};
     res.content = cv::Rect(left, top, pad_w, pad_h);
 
+    // ---- 輸出 buffer ----
+    //   RGB  :res.img(尺寸 / 型別相同時 create 不會重新配置)
+    //   quant:want_quant = false → 不產生(res.quant 清空)
+    //          quant_dst != nullptr → 直接寫進呼叫端的 Mat(例如 DPU 輸入),res.quant 與它共用記憶體
+    //          否則 → res.quant
     res.img.create(input_size, input_size, CV_8UC3);
-    res.quant.create(input_size, input_size, CV_8SC3);
+    if (!want_quant) {
+        res.quant.release();
+    } else if (quant_dst) {
+        CV_Assert(quant_dst->type() == CV_8SC3 &&
+                  quant_dst->rows == input_size && quant_dst->cols == input_size);
+        res.quant = *quant_dst;
+    } else {
+        res.quant.create(input_size, input_size, CV_8SC3);
+    }
 
-    // 只塗黑邊,不整張 setTo —— 內容區馬上會被覆蓋
-    // RGB 黑邊 = 0;quant 黑邊 = quant_byte(0)
-    const cv::Scalar rgb_fill = cv::Scalar::all(0);
-    const cv::Scalar q_fill   = cv::Scalar::all(quant_byte(0));
-    auto fill_borders = [&](cv::Mat& m, const cv::Scalar& v) {
-        if (top > 0)
-            m(cv::Rect(0, 0, input_size, top)).setTo(v);
-        if (top + pad_h < input_size)
-            m(cv::Rect(0, top + pad_h, input_size, input_size - top - pad_h)).setTo(v);
-        if (left > 0)
-            m(cv::Rect(0, top, left, pad_h)).setTo(v);
-        if (left + pad_w < input_size)
-            m(cv::Rect(left + pad_w, top, input_size - left - pad_w, pad_h)).setTo(v);
-    };
-    fill_borders(res.img,   rgb_fill);
-    fill_borders(res.quant, q_fill);
+    // ---- 黑邊:只在 buffer / 內容區 / 填值改變時才填(通常只有第一幀)----
+    //   RGB 黑邊 = 0;quant 黑邊 = quant_pad()(每個通道不同,與 norm_and_fix_letterbox 相同)
+    BorderCache& bc = border_cache();
+    bc.fill(res.img, res.content, cv::Scalar::all(0));
+    if (want_quant) bc.fill(res.quant, res.content, quant_pad());
 
     cv::Mat roi  = res.img(res.content);
-    cv::Mat qroi = res.quant(res.content);
+    cv::Mat qroi = want_quant ? res.quant(res.content) : cv::Mat();
 
     res.used_ip   = false;
     res.ip_scale  = 0;
@@ -557,11 +674,11 @@ void letterbox(const cv::Mat& uyvy, int input_size, LetterboxResult& res,
 
             const Stopwatch post;
             if (plan.exact) {
-                mid.copyTo(roi);              // IP 一次到位:RGB 與 quant 各一次 copy
-                qmid.copyTo(qroi);
+                mid.copyTo(roi);                          // IP 一次到位:RGB 一次 copy
+                if (want_quant) qmid.copyTo(qroi);        // quant 一次 copy(quant_dst 時直接進 DPU 輸入)
             } else {
                 cv::resize(mid, roi, roi.size(), 0, 0, cv::INTER_AREA);
-                quantize_mat(roi, qroi);      // 縮過之後 IP 的 quant 已不適用,由 CPU 重新量化
+                if (want_quant) quantize_mat(roi, qroi);  // 縮過之後 IP 的 quant 已不適用,由 CPU 用同一份 kLut 重新量化
             }
             res.timing.post_ms   = post.ms();
             res.timing.total_ms += res.timing.post_ms;
@@ -570,8 +687,9 @@ void letterbox(const cv::Mat& uyvy, int input_size, LetterboxResult& res,
         res.reason = "IP 執行失敗,已退回 CPU(原因見 last_error())";
     }
 
-    // ---- 退路:OpenCV 轉色 + 縮放 + CPU 量化 ----
-    // 與 IP 不是位元一致(係數與捨入不同),但對推論沒有實質影響。
+    // ---- 退路:OpenCV 轉色 + 縮放 + CPU 量化(kLut)----
+    // RGB 與 IP 不是位元一致(係數與捨入不同),但對推論沒有實質影響;
+    // quant 對「這張 RGB」而言與 IP / norm_and_fix 的公式相同。
     const Stopwatch cpu;
     thread_local cv::Mat full_rgb;
     cv::cvtColor(uyvy, full_rgb, cv::COLOR_YUV2RGB_UYVY);
@@ -579,15 +697,19 @@ void letterbox(const cv::Mat& uyvy, int input_size, LetterboxResult& res,
         full_rgb.copyTo(roi);
     else
         cv::resize(full_rgb, roi, roi.size(), 0, 0, cv::INTER_AREA);
-    quantize_mat(roi, qroi);
+    if (want_quant) quantize_mat(roi, qroi);
     res.timing.post_ms  = cpu.ms();
     res.timing.total_ms = res.timing.post_ms;
+}
+
+void letterbox_invalidate_borders() {
+    border_cache().clear();
 }
 
 LetterboxResult letterbox(const cv::Mat& uyvy, int input_size, bool allow_ip,
                           uint64_t in_phys) {
     LetterboxResult res;
-    letterbox(uyvy, input_size, res, allow_ip, in_phys);
+    letterbox(uyvy, input_size, res, allow_ip, in_phys, nullptr, true);
     return res;
 }
 
@@ -629,7 +751,7 @@ VerifyReport verify(const cv::Mat& uyvy, int scale) {
         }
     }
 
-    // ---- quant ----
+    // ---- quant(參考值 = kLut,即 norm_and_fix_letterbox 在 fix_point = kFixPoint)----
     rep.q_total = p.quant_bytes;
     for (int y = 0; y < static_cast<int>(p.out_h); ++y) {
         const int8_t* a = hwq.ptr<int8_t>(y);
@@ -655,15 +777,32 @@ VerifyReport verify(const cv::Mat& uyvy, int scale) {
     }
 
     // ---- 診斷訊息 ----
+    char msg[256];
     if (rep.passed()) {
-        rep.reason = "RGB 與 quant 皆完全一致";
+        std::snprintf(msg, sizeof msg, "RGB 與 quant 皆完全一致(quant fix_point=%d)", kFixPoint);
+        rep.reason = msg;
     } else if (rep.rgb_ok() && !rep.quant_ok()) {
-        if (rep.q_mismatches && rep.q_max_diff == 128)
-            rep.reason = "RGB 對、quant 差 128 —— 量化可能多/少了 -128 偏移(符號或 zero-point)";
-        else if (rep.q_mismatches)
-            rep.reason = "RGB 對、quant 不符 —— 量化公式(scale / zero-point / 捨入)與 quant_byte() 不同";
-        else
+        if (!rep.q_mismatches) {
             rep.reason = "RGB 對,但 quant 最後一個 word 的補位不是 0";
+        } else {
+            // RGB 已確認正確 → 用它推算 IP 實際用的量化表
+            const int ow = static_cast<int>(p.out_w), oh = static_cast<int>(p.out_h);
+            const int fp      = match_fix_point(hw, hwq, ow, oh, false);
+            const int fp_swap = match_fix_point(hw, hwq, ow, oh, true);
+            if (fp != INT_MIN)
+                std::snprintf(msg, sizeof msg,
+                              "RGB 對、quant 不符 —— IP 的 LUT 是 fix_point=%d,軟體的 quantize_lut.h 是 %d:"
+                              "bitstream 與軟體版本不一致", fp, kFixPoint);
+            else if (fp_swap != INT_MIN)
+                std::snprintf(msg, sizeof msg,
+                              "RGB 對、quant 不符 —— IP 的量化 R/B 查表對調(fix_point=%d),"
+                              "檢查 quantize_core 的位元位置", fp_swap);
+            else
+                std::snprintf(msg, sizeof msg,
+                              "RGB 對、quant 不符 —— 不等於任何 fix_point 的 norm_and_fix,"
+                              "檢查 quantize_core 與 bitstream 版本");
+            rep.reason = msg;
+        }
     } else if (!rep.rgb_ok() && rep.quant_ok()) {
         rep.reason = "RGB 不符但 quant 一致(異常)—— 檢查 resize_axi_bus 的位址與 cache 同步";
     } else if (rep.pad_dirty && !rep.mismatches) {

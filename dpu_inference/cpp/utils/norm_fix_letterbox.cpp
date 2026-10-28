@@ -3,7 +3,7 @@
 //
 // 計算路徑在編譯期決定：
 //   - AArch64（ARMv8，含 KV260 的 Cortex-A53）→ NEON 查表（TBL/TBX）
-//   - 其他平台（x86、32-bit ARM 等）          → 一般計算（原本 norm_and_fix 的 float 公式）
+//   - 其他平台（x86、32-bit ARM 等）          → 一般計算（原本 norm_and_fix 的 double 公式）
 //   - 編譯時加 -DLBN_FORCE_GENERIC           → 在 ARM 上也強制走一般計算（方便比對或除錯）
 //
 // 注意：NEON 查表用到的 vqtbl4q / vqtbx4q 只存在於 AArch64；
@@ -39,15 +39,15 @@
 namespace {
  
 // ---- 正規化參數：與原本 .cpp 的定義逐字相同 ----
-constexpr float kMeanR = 0.485f, kMeanG = 0.456f, kMeanB = 0.406f;
-constexpr float kStdR  = 0.229f, kStdG  = 0.224f, kStdB  = 0.225f;
+constexpr double kMeanR = 0.485, kMeanG = 0.456, kMeanB = 0.406;
+constexpr double kStdR  = 0.229, kStdG  = 0.224, kStdB  = 0.225;
  
-constexpr float kU8ScaleR = 1.f/(kStdR*255.f);
-constexpr float kU8ScaleG = 1.f/(kStdG*255.f);
-constexpr float kU8ScaleB = 1.f/(kStdB*255.f);
-constexpr float kU8BiasR  = -kMeanR/kStdR;
-constexpr float kU8BiasG  = -kMeanG/kStdG;
-constexpr float kU8BiasB  = -kMeanB/kStdB;
+constexpr double kU8ScaleR = 1./(kStdR*255.);
+constexpr double kU8ScaleG = 1./(kStdG*255.);
+constexpr double kU8ScaleB = 1./(kStdB*255.);
+constexpr double kU8BiasR  = -kMeanR/kStdR;
+constexpr double kU8BiasG  = -kMeanG/kStdG;
+constexpr double kU8BiasB  = -kMeanB/kStdB;
  
 #if LBN_USE_NEON_LUT
 // ===========================================================================
@@ -63,17 +63,17 @@ constexpr float kU8BiasB  = -kMeanB/kStdB;
 //   GCC 在 aarch64 上預設會把原本 norm_and_fix 的 a*b+c 編譯成 fmla（融合乘加），
 //   只有 -ffp-contract=off 或 -O0 才不會。以這組參數來說，G 通道 v=102 時
 //   理論值剛好是整數（-0.25 × 2^fix_point），融合與否會差 1。
-//   明確呼叫 std::fma 讓查表結果不受編譯選項影響，固定與 KV260 上 -O2/-O3 的 float 版一致。
-//   若你的 float 版是用 -ffp-contract=off 編的，把 std::fma(...) 改成 v * s + b 即可。
+//   明確呼叫 std::fma 讓查表結果不受編譯選項影響，固定與 KV260 上 -O2/-O3 的 double 版一致。
+//   若你的 double 版是用 -ffp-contract=off 編的，把 std::fma(...) 改成 v * s + b 即可。
 void build_lut(int fix_point, int8_t lut[768])
 {
-    const float fp = std::exp2f(static_cast<float>(fix_point));
-    const float scale[3] = {kU8ScaleR * fp, kU8ScaleG * fp, kU8ScaleB * fp};
-    const float bias[3]  = {kU8BiasR  * fp, kU8BiasG  * fp, kU8BiasB  * fp};
+    const double fp = std::exp2f(static_cast<double>(fix_point));
+    const double scale[3] = {kU8ScaleR * fp, kU8ScaleG * fp, kU8ScaleB * fp};
+    const double bias[3]  = {kU8BiasR  * fp, kU8BiasG  * fp, kU8BiasB  * fp};
     for (int c = 0; c < 3; ++c)
         for (int v = 0; v < 256; ++v) {
-            const float y = std::fma(static_cast<float>(v), scale[c], bias[c]);
-            lut[256*c + v] = static_cast<int8_t>(std::clamp(y, -128.f, 127.f));
+            const double y = std::fma(static_cast<double>(v), scale[c], bias[c]);
+            lut[256*c + v] = static_cast<int8_t>(std::clamp(y, -128.d, 127.d));
         }
 }
 // ===== END LUT BUILD =====
@@ -143,19 +143,19 @@ void lut_kernel(const uint8_t* LBN_RESTRICT src,
  
 // ===== BEGIN GENERIC KERNEL =====
 // scale/bias 已乘上 2^fix_point
-void float_kernel(const uint8_t* LBN_RESTRICT src,
+void double_kernel(const uint8_t* LBN_RESTRICT src,
                   int8_t*        LBN_RESTRICT dst,
                   std::ptrdiff_t total,
-                  const float scale[3], const float bias[3])
+                  const double scale[3], const double bias[3])
 {
-    const float scaleR = scale[0], scaleG = scale[1], scaleB = scale[2];
-    const float biasR  = bias[0],  biasG  = bias[1],  biasB  = bias[2];
+    const double scaleR = scale[0], scaleG = scale[1], scaleB = scale[2];
+    const double biasR  = bias[0],  biasG  = bias[1],  biasB  = bias[2];
  
     #pragma omp simd
     for (std::ptrdiff_t i = 0; i < total; ++i) {
-        dst[3*i + 0] = static_cast<int8_t>(std::clamp(src[3*i + 0] * scaleR + biasR, -128.f, 127.f));
-        dst[3*i + 1] = static_cast<int8_t>(std::clamp(src[3*i + 1] * scaleG + biasG, -128.f, 127.f));
-        dst[3*i + 2] = static_cast<int8_t>(std::clamp(src[3*i + 2] * scaleB + biasB, -128.f, 127.f));
+        dst[3*i + 0] = static_cast<int8_t>(std::clamp(src[3*i + 0] * scaleR + biasR, -128.d, 127.d));
+        dst[3*i + 1] = static_cast<int8_t>(std::clamp(src[3*i + 1] * scaleG + biasG, -128.d, 127.d));
+        dst[3*i + 2] = static_cast<int8_t>(std::clamp(src[3*i + 2] * scaleB + biasB, -128.d, 127.d));
     }
 }
 // ===== END GENERIC KERNEL =====
@@ -183,7 +183,7 @@ struct Cache {
 #if LBN_USE_NEON_LUT
     int8_t lut[768];                     // NEON 路徑：查表
 #else
-    float scale[3], bias[3];             // 一般路徑：已乘上 2^fix_point 的係數
+    double scale[3], bias[3];             // 一般路徑：已乘上 2^fix_point 的係數
 #endif
     int8_t    pad[3];                    // 黑色 (0,0,0) 正規化後的值
     PadRecord pads[kMaxBuffers];
@@ -205,13 +205,13 @@ void prepare(Cache& c, int fix_point)
     c.pad[1] = c.lut[256];
     c.pad[2] = c.lut[512];
 #else
-    const float fp = std::exp2f(static_cast<float>(fix_point));
+    const double fp = std::exp2f(static_cast<double>(fix_point));
     c.scale[0] = kU8ScaleR * fp;  c.bias[0] = kU8BiasR * fp;
     c.scale[1] = kU8ScaleG * fp;  c.bias[1] = kU8BiasG * fp;
     c.scale[2] = kU8ScaleB * fp;  c.bias[2] = kU8BiasB * fp;
     // src = 0 時 0 * scale + bias = bias（無論是否融合乘加都一樣）
     for (int k = 0; k < 3; ++k)
-        c.pad[k] = static_cast<int8_t>(std::clamp(c.bias[k], -128.f, 127.f));
+        c.pad[k] = static_cast<int8_t>(std::clamp(c.bias[k], -128.d, 127.d));
 #endif
     c.fix_point = fix_point;
 }
@@ -222,7 +222,7 @@ inline void run_kernel(const Cache& c, const uint8_t* src, int8_t* dst, std::ptr
 #if LBN_USE_NEON_LUT
     lut_kernel(src, dst, n, c.lut);
 #else
-    float_kernel(src, dst, n, c.scale, c.bias);
+    double_kernel(src, dst, n, c.scale, c.bias);
 #endif
 }
 

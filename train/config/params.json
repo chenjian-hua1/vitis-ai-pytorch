@@ -26,5 +26,5 @@
   "flip_ud": 0.0,
   "flip_lr": 0.5,
 
-  "multi_scale": true
+  "multi_scale": false
 }
