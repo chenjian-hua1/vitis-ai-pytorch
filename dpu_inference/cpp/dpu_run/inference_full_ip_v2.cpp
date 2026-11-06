@@ -510,10 +510,13 @@ void run_camera(
 
             const double t_cpu_process = fpipe::now_ms(); // CPU work during DPU inference start
             // TODO : do something here
-            const double t_wait = fpipe::now_ms(); // CPU wait start time
-            tm_cpu_when_wait_dpu.add(t_wait - t_cpu_process);
 
+            // ------------------------------------------------s
+            tm_cpu_when_wait_dpu.add(fpipe::now_ms() - t_cpu_process);
+            
+            const double t_wait = fpipe::now_ms(); // CPU wait start time
             engine.wait_hw(0); // wait DPU interrupt
+            
             const double t_done = fpipe::now_ms();
             tm_wait_dpu.add(t_done - t_wait);
             tm_dpu_hw.add(t_done - t0);
@@ -606,7 +609,7 @@ void run_camera(
                       + tm_dpu_sw.avg() + tm_post.avg() + tm_out.avg();
     const double hw = tm_wait_dpu.avg() + tm_ip.avg();  // waiting for hardware
 
-    std::cout << "\n──────── Statistics ────────\n"
+    std::cout << "\n======== Statistics ========\n"
               << "Processed " << n_proc.load() << " frames, "
               << "captured " << cam.frames() << " frames, "
               << "dropped stale V4L2 frames " << cam.stale() << ", skipped "
@@ -624,12 +627,12 @@ void run_camera(
               << "    CPU overlap work  " << tm_cpu_when_wait_dpu.avg() << " ms\n"
               << "    remaining wait    " << tm_wait_dpu.avg() << " ms"
               << "  (near 0 means CPU work takes longer than DPU, adding latency)\n"
-              << "  DPU output memcpy   " << tm_dpu_sw.avg() << " ms  (no copy, should be ~0)\n"
+              << "  DPU output memcpy   " << std::setprecision(3) << tm_dpu_sw.avg() << " ms  (no copy, should be ~0)\n"
               << "  postprocess + track " << tm_post.avg()
               << " ms  (direct int8 decode, no transpose / fix2float)\n"
               << "  draw + stream       " << tm_out.avg()
               << " ms  (of which drawing only " << tm_draw.avg() << " ms)\n"
-              << "  ── processing total " << proc << " ms\n"
+              << "  -- processing total " << proc << " ms\n"
               << "     hardware wait    " << hw << " ms\n"
               << "     CPU work         " << (proc - hw) << " ms\n\n"
               << "End-to-end latency  avg " << tm_lat.avg()
