@@ -38,3 +38,18 @@ struct DetectionBatch {
     const Detection* end()   const { return data.data() + count; }
     int              size()  const { return count; }
 };
+
+/**
+ * @brief Output map structure for DPU inference results
+ * 
+ * @addtogroup dpu_inference
+ * 
+ * @param map Pointer to the output map data (cv::Mat)
+ * @param stride Stride value for the output map
+ * @param scale Scale factor for the output map
+ */
+struct OutputMap {
+    cv::Mat map;
+    int stride;
+    double scale;
+};

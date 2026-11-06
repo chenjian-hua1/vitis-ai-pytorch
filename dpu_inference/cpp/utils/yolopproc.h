@@ -37,7 +37,17 @@
 //       (a * no_ + ...)」，多了乘加，吃掉了 sequential read 的便宜。
 //  教訓：cache locality 紅利只有在 hot loop 真正 cache-bound 時才會兌現。
 //
-
+/**
+ * @brief YOLOPostProcessor constructor
+ * @param batch Batch size
+ * @param input_h Input height
+ * @param input_w Input width
+ * @param nc Number of classes (default: 80)
+ * @param ch Number of distance channels (default: 16)
+ * @param strides Vector of strides for distance maps (default: {8, 16, 32})
+ * @param max_nms Maximum number of candidates for NMS (default: 5000)
+ * @param max_det Maximum number of detections to keep (default: 100)
+ */
 class YOLOPostProcessor {
 public:
     enum class Layout { NCHW, NHWC };
@@ -47,7 +57,6 @@ public:
     //   Cacheable    : 已是 cacheable（例如自己 malloc 的 buffer），直接掃描，不 memcpy
     //   NonCacheable : DPU non-cacheable buffer，一律先整塊 memcpy 再掃描
     enum class MemHint { Auto, Cacheable, NonCacheable };
-
     YOLOPostProcessor(int batch,
                       int input_h,
                       int input_w,

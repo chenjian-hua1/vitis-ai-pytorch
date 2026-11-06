@@ -302,3 +302,38 @@ void norm_and_fix_letterbox(const cv::Mat& x, int fix_point, const cv::Rect& con
             run_kernel(c, x.ptr<uint8_t>(y) + 3*x0, out.ptr<int8_t>(y) + 3*x0, w);
     }
 }
+
+void norm_fix_img(
+    const cv::Mat& img,
+    cv::Mat& out,
+    double fix_scale
+) {
+    // input image and output image shape is mismatch
+    if (img.cols != out.cols || img.rows != out.rows)
+        std::cerr << "norm_fix_img: input and output size mismatch" << std::endl;
+
+    const double scale[3] = {
+        kU8ScaleR * fix_scale,
+        kU8ScaleG * fix_scale,
+        kU8ScaleB * fix_scale
+    };
+    const double bias[3] = {
+        kU8BiasR * fix_scale,
+        kU8BiasB * fix_scale,
+        kU8BiasG * fix_scale
+    };
+
+    for (int r = 0; r < img.rows; ++r) {
+        const uint8_t* src = img.ptr<uint8_t>(r); // images row start address
+        int8_t* dst = out.ptr<int8_t>(r); // output row start address
+
+        for (int c = 0; c < img.cols; ++c) {
+            const int offset = c * 3; // element offset row_start + element_offset
+            
+            // RGB lightness normalization (included fixed point)
+            dst[offset + 0] = static_cast<int8_t>(std::clamp(src[offset + 0] * scale[0] + bias[0], -128.0, 127.0));
+            dst[offset + 1] = static_cast<int8_t>(std::clamp(src[offset + 1] * scale[1] + bias[1], -128.0, 127.0));
+            dst[offset + 2] = static_cast<int8_t>(std::clamp(src[offset + 2] * scale[2] + bias[2], -128.0, 127.0));
+        }
+    }    
+}

@@ -23,3 +23,5 @@ dpu_inference/model/yolo_kv26 copy.xmodel
 dpu_inference/cpp/eval/trackeval_io
 dpu_inference/cpp/eval/trackeval_tmp
 **/hls_include
+dpu_inference/cpp/dpu_run/vivado_pid609529.str
+dpu_inference/cpp/dpu_run/vivado_pid609529.str

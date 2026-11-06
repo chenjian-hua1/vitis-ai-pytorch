@@ -41,6 +41,16 @@
 
 class DmabufCamera {
 public:
+    /** @brief Camera configuration. The default values are suitable for most cases.
+     * 
+     * @param device The V4L2 device path, e.g., "/dev/video0".
+     * @param width The desired width of the captured frames.
+     * @param height The desired height of the captured frames.
+     * @param fps The desired frames per second for capturing.
+     * @param num_buffers The number of buffers to allocate for DMABUF mode (minimum 4).
+     * @param heap The name of the DMA heap to use (default is "auto" for automatic selection).
+     * @param allow_mmap_fallback Whether to allow fallback to MMAP mode if DMABUF is not supported (default is true).
+     */
     struct Config {
         std::string device      = "/dev/video0";
         int         width       = 1920;

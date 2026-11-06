@@ -36,3 +36,13 @@ void norm_and_fix_letterbox(const cv::Mat& x, int fix_point, const cv::Rect& con
 
 // 清除目前執行緒的快取：下一次呼叫會重建查表並重填黑邊，同時釋放持有的舊 buffer
 void norm_letterbox_reset();
+
+/** @brief norm and fix image
+ * 
+ * out = clamp(norm(img) * fix_scale,-128,127)
+ * 
+ * @param img input image
+ * @param out output image
+ * @param fix_scale fix scale
+ */
+void norm_fix_img(const cv::Mat& img, cv::Mat& out, double fix_scale);

@@ -58,7 +58,7 @@
 #include "yolopproc.h"
 #include "camera.h"            // 只用到 Camera::Config(CLI 參數)
 #include "v4l2_dmabuf_camera.h"
-#include "preproc.h"
+// #include "preproc.h"
 #include "cli_args.h"
 #include "frame_pipeline.h"
 #include "hls_uyvy_resize_quant.h"
